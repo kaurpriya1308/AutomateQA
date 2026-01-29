@@ -573,6 +573,7 @@ def main():
     if clear_button:
         st.session_state.audit_results = None
         st.session_state.audit_data = None
+        st.session_state.json_input = ""  # Clear the text area
         st.rerun()
     
     # Run Audit
