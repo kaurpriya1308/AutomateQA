@@ -539,18 +539,30 @@ def main():
         st.session_state.audit_results = None
     if 'audit_data' not in st.session_state:
         st.session_state.audit_data = None
-    if 'json_input' not in st.session_state:  # Add this
-        st.session_state.json_input = ""
+    if 'clear_trigger' not in st.session_state:
+        st.session_state.clear_trigger = False
     
     # JSON Input Section
     st.subheader("📝 JSON Input")
+    
+    # Set default value for text area
+    default_value = "" if st.session_state.clear_trigger else st.session_state.get('last_input', '')
+    
     json_input = st.text_area(
         "Paste your JSON data here:",
         height=300,
         placeholder='{\n  "id": "12345",\n  "as_company_id": "TICKER",\n  "after_save_pageurls": [...]\n}',
-        key="json_input",
-        value=st.session_state.json_input  # Add this
+        value=default_value,
+        key="json_text_area"
     )
+    
+    # Store current input
+    if json_input and not st.session_state.clear_trigger:
+        st.session_state.last_input = json_input
+    
+    # Reset clear trigger
+    if st.session_state.clear_trigger:
+        st.session_state.clear_trigger = False
     
     # Buttons
     col1, col2, col3, col4 = st.columns([2, 2, 2, 6])
@@ -575,7 +587,8 @@ def main():
     if clear_button:
         st.session_state.audit_results = None
         st.session_state.audit_data = None
-        st.session_state.json_input = ""  # Clear the text area
+        st.session_state.last_input = ""
+        st.session_state.clear_trigger = True
         st.rerun()
     
     # Run Audit
