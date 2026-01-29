@@ -509,7 +509,6 @@ def display_url_wrapped(url, max_length=80):
     """Display URL with text wrapping"""
     return f'<div class="url-text">{url}</div>'
 
-d
 def main():
     # Header
     st.title("🔍 URL Audit Tool")
