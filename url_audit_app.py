@@ -336,55 +336,55 @@ class URLAuditor:
 
     @staticmethod
     def check_http(urls):
-    """Check HTTP URL format"""
-    issues = []
-    keywords = [r'^df', r'^if', r'^ev', r'^cp']
-    pattern = '|'.join(keywords)
+        """Check HTTP URL format"""
+        issues = []
+        keywords = [r'^df', r'^if', r'^ev', r'^cp']
+        pattern = '|'.join(keywords)
     
-    for idx, url in enumerate(urls, 1):
-        if not isinstance(url, str) or len(url) <= 5:
-            continue
-        
-        is_special = bool(re.search(pattern, url, re.IGNORECASE))
-        if is_special:
-            continue
-        
-        has_http = "http" in url.lower()
-        has_multiple_http = bool(re.search(r"http.*http", url, re.IGNORECASE))
-        
-        # If multiple http found, check if first one is in baseurl template
-        if has_multiple_http:
-            # Pattern to match ${baseurl} with http inside it
-            baseurl_pattern = r'\$\{baseurl\=\:\"http'
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str) or len(url) <= 5:
+                continue
             
-            # Remove the baseurl template and check if there's still multiple http
-            url_without_baseurl = re.sub(baseurl_pattern, '', url, count=1, flags=re.IGNORECASE)
+            is_special = bool(re.search(pattern, url, re.IGNORECASE))
+            if is_special:
+                continue
             
-            # Re-check for multiple http after removing baseurl
-            has_multiple_http = bool(re.search(r"http.*http", url_without_baseurl, re.IGNORECASE))
+            has_http = "http" in url.lower()
+            has_multiple_http = bool(re.search(r"http.*http", url, re.IGNORECASE))
+            
+            # If multiple http found, check if first one is in baseurl template
+            if has_multiple_http:
+                # Pattern to match ${baseurl} with http inside it
+                baseurl_pattern = r'\$\{baseurl\=\:\"http'
+                
+                # Remove the baseurl template and check if there's still multiple http
+                url_without_baseurl = re.sub(baseurl_pattern, '', url, count=1, flags=re.IGNORECASE)
+                
+                # Re-check for multiple http after removing baseurl
+                has_multiple_http = bool(re.search(r"http.*http", url_without_baseurl, re.IGNORECASE))
+            
+            has_newline = bool(re.search(r"\n", url))
+            
+            if not has_http:
+                issues.append({
+                    "type": "Missing HTTP/HTTPS",
+                    "url_index": idx,
+                    "url": url
+                })
+            elif has_multiple_http:
+                issues.append({
+                    "type": "Multiple HTTP in URL",
+                    "url_index": idx,
+                    "url": url
+                })
+            elif has_newline:
+                issues.append({
+                    "type": "Newline character in URL",
+                    "url_index": idx,
+                    "url": url
+                })
         
-        has_newline = bool(re.search(r"\n", url))
-        
-        if not has_http:
-            issues.append({
-                "type": "Missing HTTP/HTTPS",
-                "url_index": idx,
-                "url": url
-            })
-        elif has_multiple_http:
-            issues.append({
-                "type": "Multiple HTTP in URL",
-                "url_index": idx,
-                "url": url
-            })
-        elif has_newline:
-            issues.append({
-                "type": "Newline character in URL",
-                "url_index": idx,
-                "url": url
-            })
-    
-    return issues
+        return issues
 
     @staticmethod
     def check_brackets(urls):
