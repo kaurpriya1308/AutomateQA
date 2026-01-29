@@ -509,7 +509,7 @@ def display_url_wrapped(url, max_length=80):
     """Display URL with text wrapping"""
     return f'<div class="url-text">{url}</div>'
 
-
+d
 def main():
     # Header
     st.title("🔍 URL Audit Tool")
@@ -540,6 +540,8 @@ def main():
         st.session_state.audit_results = None
     if 'audit_data' not in st.session_state:
         st.session_state.audit_data = None
+    if 'json_input' not in st.session_state:  # Add this
+        st.session_state.json_input = ""
     
     # JSON Input Section
     st.subheader("📝 JSON Input")
@@ -547,7 +549,8 @@ def main():
         "Paste your JSON data here:",
         height=300,
         placeholder='{\n  "id": "12345",\n  "as_company_id": "TICKER",\n  "after_save_pageurls": [...]\n}',
-        key="json_input"
+        key="json_input",
+        value=st.session_state.json_input  # Add this
     )
     
     # Buttons
