@@ -2,14 +2,8 @@ import streamlit as st
 import json
 import re
 from datetime import datetime
-from urllib.parse import urljoin, urlparse, urlunparse
-import requests
-from bs4 import BeautifulSoup
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
-import pandas as pd
 
+# Page configuration
 st.set_page_config(
     page_title="URL Audit Tool",
     page_icon="🔍",
@@ -17,9 +11,12 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# Custom CSS for better text wrapping and styling
 st.markdown("""
     <style>
-    .main { padding: 2rem; }
+    .main {
+        padding: 2rem;
+    }
     .stTextArea textarea {
         font-family: 'Courier New', monospace;
         font-size: 12px;
@@ -35,6 +32,13 @@ st.markdown("""
         border-radius: 4px;
         margin: 5px 0;
     }
+    .issue-box {
+        border-left: 4px solid #ff4b4b;
+        padding: 15px;
+        margin: 10px 0;
+        background-color: #fff5f5;
+        border-radius: 4px;
+    }
     .success-box {
         border-left: 4px solid #00c853;
         padding: 15px;
@@ -42,1000 +46,668 @@ st.markdown("""
         background-color: #f1f8f4;
         border-radius: 4px;
     }
-    .crawl-progress {
-        font-family: 'Courier New', monospace;
-        font-size: 11px;
-        color: #666;
-    }
-    .dataframe a {
-        color: #1a73e8;
-        text-decoration: none;
-    }
-    .dataframe a:hover {
-        text-decoration: underline;
+    .summary-card {
+        padding: 20px;
+        border-radius: 8px;
+        margin: 10px 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     </style>
 """, unsafe_allow_html=True)
 
 
-# =============================================================================
-# DOMAIN UTILITY
-# =============================================================================
-class DomainUtil:
-
-    @staticmethod
-    def get_domain_root(url):
-        try:
-            parsed = urlparse(url.strip())
-            if not parsed.scheme or not parsed.netloc:
-                return None
-            return urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
-        except Exception:
-            return None
-
-    @staticmethod
-    def get_normalized_domain(url):
-        try:
-            parsed = urlparse(url.strip())
-            return parsed.netloc.lower().replace('www.', '')
-        except Exception:
-            return None
-
-    @staticmethod
-    def extract_unique_domain_roots(urls):
-        domain_map = {}
-        for url in urls:
-            if not isinstance(url, str):
-                continue
-            url = url.strip()
-            if not url.startswith('http'):
-                continue
-            root = DomainUtil.get_domain_root(url)
-            norm = DomainUtil.get_normalized_domain(url)
-            if root and norm and norm not in domain_map:
-                domain_map[norm] = root
-        return domain_map
-
-
-# =============================================================================
-# CONCURRENT DOMAIN CRAWLER
-# =============================================================================
-class ConcurrentDomainCrawler:
-
-    EXCLUDED_EXTENSIONS = {
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-        '.zip', '.rar', '.tar', '.gz', '.7z',
-        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.ico', '.webp',
-        '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.wav',
-        '.css', '.js', '.woff', '.woff2', '.ttf', '.eot', '.otf',
-        '.exe', '.dmg', '.msi', '.apk',
-    }
-
-    EXCLUDED_PATH_PATTERNS = [
-        r'/wp-content/', r'/wp-includes/', r'/wp-admin/',
-        r'/assets/', r'/static/', r'/images/', r'/img/',
-        r'/fonts/', r'/css/', r'/js/',
-        r'javascript:', r'mailto:', r'tel:',
-        r'/cdn-cgi/', r'/feed/', r'/rss/',
-        r'/login', r'/logout', r'/signup', r'/register',
-        r'/cart', r'/checkout', r'/account',
-        r'/page/\d+', r'\?replytocom=',
-        r'/xmlrpc\.php', r'/wp-json/',
-    ]
-
-    def __init__(self, max_depth=10, max_pages=1000, max_workers=50,
-                 timeout=10, delay=0.1):
-        self.max_depth = max_depth
-        self.max_pages = max_pages
-        self.max_workers = max_workers
-        self.timeout = timeout
-        self.delay = delay
-        self._lock = threading.Lock()
-        self._pages_crawled = 0
-
-    def _make_session(self):
-        s = requests.Session()
-        s.headers.update({
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
-            ),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        })
-        s.max_redirects = 5
-        return s
-
-    def _is_valid_url(self, url, allowed_domains):
-        try:
-            parsed = urlparse(url)
-            if not parsed.scheme or parsed.scheme not in ('http', 'https'):
-                return False
-            if not parsed.netloc:
-                return False
-            domain = parsed.netloc.lower().replace('www.', '')
-            if domain not in allowed_domains:
-                return False
-            path_lower = parsed.path.lower()
-            for ext in self.EXCLUDED_EXTENSIONS:
-                if path_lower.endswith(ext):
-                    return False
-            url_lower = url.lower()
-            for pat in self.EXCLUDED_PATH_PATTERNS:
-                if re.search(pat, url_lower):
-                    return False
-            return True
-        except Exception:
-            return False
-
-    def _normalize_url(self, url):
-        try:
-            parsed = urlparse(url)
-            normalized = parsed._replace(fragment='')
-            path = normalized.path.rstrip('/') or '/'
-            normalized = normalized._replace(path=path)
-            if normalized.query:
-                clean = [
-                    p for p in normalized.query.split('&')
-                    if p.split('=')[0].lower() not in
-                    ('utm_source', 'utm_medium', 'utm_campaign',
-                     'utm_term', 'utm_content', 'fbclid', 'gclid')
-                ]
-                normalized = normalized._replace(query='&'.join(clean))
-            return normalized.geturl()
-        except Exception:
-            return url
-
-    def _fetch_links(self, url, session):
-        links = []
-        try:
-            time.sleep(self.delay)
-            r = session.get(url, timeout=self.timeout, allow_redirects=True)
-            if r.status_code != 200:
-                return links
-            if 'text/html' not in r.headers.get('Content-Type', ''):
-                return links
-            soup = BeautifulSoup(r.text, 'html.parser')
-            for a in soup.find_all('a', href=True):
-                href = a['href'].strip()
-                if href and not href.startswith('#') and not href.startswith('javascript:'):
-                    links.append(urljoin(url, href))
-        except Exception:
-            pass
-        return links
-
-    def _crawl_batch(self, urls_with_depth, allowed_domains, visited, session):
-        new_urls = []
-        for url, depth in urls_with_depth:
-            if depth > self.max_depth:
-                continue
-            with self._lock:
-                if url in visited:
-                    continue
-                visited.add(url)
-                self._pages_crawled += 1
-                if self._pages_crawled > self.max_pages:
-                    return new_urls
-            for link in self._fetch_links(url, session):
-                norm = self._normalize_url(link)
-                if self._is_valid_url(norm, allowed_domains):
-                    with self._lock:
-                        if norm not in visited:
-                            new_urls.append((norm, depth + 1))
-        return new_urls
-
-    def crawl(self, domain_roots, progress_callback=None):
-        allowed_domains = set(domain_roots.keys())
-        seed_urls = list(domain_roots.values())
-        if not seed_urls:
-            return {}
-
-        self._pages_crawled = 0
-        visited = set()
-        all_discovered = {}
-        current_level = []
-
-        for norm_domain, root_url in domain_roots.items():
-            normalized = self._normalize_url(root_url)
-            all_discovered[normalized] = {
-                "seed": root_url, "depth": 0, "domain": norm_domain
-            }
-            current_level.append((normalized, 0))
-
-        if progress_callback:
-            progress_callback(0, len(seed_urls), len(all_discovered), 0,
-                              f"Starting: {len(seed_urls)} domain root(s)")
-
-        for depth_level in range(self.max_depth + 1):
-            if not current_level or self._pages_crawled >= self.max_pages:
-                break
-
-            batch_size = max(1, len(current_level) // self.max_workers)
-            batches = [current_level[i:i + batch_size]
-                       for i in range(0, len(current_level), batch_size)]
-            next_level = []
-
-            with ThreadPoolExecutor(
-                max_workers=min(self.max_workers, max(len(batches), 1))
-            ) as ex:
-                futures = [
-                    ex.submit(self._crawl_batch, batch, allowed_domains,
-                              visited, self._make_session())
-                    for batch in batches
-                ]
-                for f in as_completed(futures):
-                    try:
-                        for new_url, new_depth in f.result(timeout=120):
-                            if new_url not in all_discovered:
-                                parsed = urlparse(new_url)
-                                domain = parsed.netloc.lower().replace('www.', '')
-                                root = domain_roots.get(domain, seed_urls[0])
-                                all_discovered[new_url] = {
-                                    "seed": root, "depth": new_depth, "domain": domain
-                                }
-                                next_level.append((new_url, new_depth))
-                    except Exception:
-                        continue
-
-            if progress_callback:
-                progress_callback(
-                    self._pages_crawled, len(next_level), len(all_discovered),
-                    depth_level,
-                    f"Depth {depth_level} done | Crawled: {self._pages_crawled} | "
-                    f"Next: {len(next_level)}"
-                )
-            current_level = next_level
-
-        return all_discovered
-
-
-# =============================================================================
-# URL MATCHING
-# =============================================================================
-class URLMatcher:
-
-    @staticmethod
-    def extract_regex_patterns(urls):
-        return [
-            u.strip() for u in urls
-            if isinstance(u, str)
-            and re.match(r'^(ev|cp|df|if):', u.strip(), re.IGNORECASE)
-        ]
-
-    @staticmethod
-    def is_url_covered(discovered_url, after_urls, regex_patterns):
-        norm = discovered_url.rstrip('/').replace('://www.', '://')
-        for au in after_urls:
-            if not isinstance(au, str) or not au.startswith('http'):
-                continue
-            if norm == au.strip().rstrip('/').replace('://www.', '://'):
-                return True, "Exact match"
-        parsed = urlparse(discovered_url)
-        for pat_str in regex_patterns:
-            m = re.match(r'^(ev|cp|df|if):(.*)', pat_str, re.IGNORECASE)
-            if not m:
-                continue
-            regex_part = m.group(2)
-            if not regex_part:
-                continue
-            try:
-                if re.search(regex_part, parsed.path):
-                    return True, f"Regex: {pat_str[:60]}"
-                if re.search(regex_part, discovered_url):
-                    return True, f"Regex: {pat_str[:60]}"
-            except re.error:
-                continue
-        return False, ""
-
-
-# =============================================================================
-# URL AUDITOR
-# =============================================================================
 class URLAuditor:
-
-    TEMPLATE_INDICATORS = [
-        r'\$\{', r'\{miny', r'\{epp', r'\{xpath', r'\{onclick',
-        r'\{json[=_]', r'\{js_', r'\{jsarg', r'\{baseurl', r'\{window',
-        r'^cp:', r'^ev:', r'^df:', r'^if:', r'wd:', r'curl:',
-        r'json:xhr:', r'json:curl:', r'appid',
-    ]
-
+    """URL Audit logic class"""
+    
     @staticmethod
-    def clean_json_input(text):
-        text = text.strip()
-        lines = [re.sub(r'^[\s\-]+', '', l) for l in text.split('\n') if l.strip()]
-        text = '\n'.join(lines)
-        if not text.startswith('{') and not text.startswith('['):
-            m = re.search(r'[{\[]', text)
-            if m:
-                text = text[m.start():]
-        if '{' in text:
-            s = text.index('{')
-            bc = 0
-            e = s
-            for i in range(s, len(text)):
-                if text[i] == '{':
-                    bc += 1
-                elif text[i] == '}':
-                    bc -= 1
-                    if bc == 0:
-                        e = i + 1
+    def clean_json_input(json_text):
+        """Clean JSON input by removing common issues"""
+        json_text = json_text.strip()
+        lines = json_text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            line = re.sub(r'^[\s\-]+', '', line)
+            if line.strip():
+                cleaned_lines.append(line)
+        
+        json_text = '\n'.join(cleaned_lines)
+        
+        if not json_text.startswith('{') and not json_text.startswith('['):
+            match = re.search(r'[{\[]', json_text)
+            if match:
+                json_text = json_text[match.start():]
+        
+        if '{' in json_text:
+            start = json_text.index('{')
+            brace_count = 0
+            end = start
+            for i in range(start, len(json_text)):
+                if json_text[i] == '{':
+                    brace_count += 1
+                elif json_text[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end = i + 1
                         break
-            text = text[s:e]
-        return text
+            json_text = json_text[start:end]
+        
+        return json_text
 
     @staticmethod
-    def parse_json(text):
-        c = URLAuditor.clean_json_input(text)
-        errs = []
-        for name, fn in [
-            ("Direct", lambda t: json.loads(t)),
-            ("Non-strict", lambda t: json.loads(t, strict=False)),
-            ("Fixed", lambda t: json.loads(
-                re.sub(r',\s*([}\]])', r'\1',
-                        re.sub(r'"\s*\n\s*"', '",\n"', t).replace("'", '"'))
-            )),
-        ]:
-            try:
-                return fn(c), None
-            except json.JSONDecodeError as e:
-                errs.append(f"{name}: {e.msg} at line {e.lineno}")
-        return None, errs
-
-    @staticmethod
-    def urls_contain_templates(urls):
-        for u in urls:
-            if not isinstance(u, str):
-                continue
-            for p in URLAuditor.TEMPLATE_INDICATORS:
-                if re.search(p, u, re.IGNORECASE):
-                    return True
-        return False
+    def parse_json(json_text):
+        """Parse JSON with multiple fallback methods"""
+        cleaned_json = URLAuditor.clean_json_input(json_text)
+        parse_errors = []
+        
+        # Approach 1: Direct parse
+        try:
+            return json.loads(cleaned_json), None
+        except json.JSONDecodeError as e:
+            parse_errors.append(f"Direct parse: {e.msg} at line {e.lineno}")
+        
+        # Approach 2: Non-strict parse
+        try:
+            return json.loads(cleaned_json, strict=False), None
+        except json.JSONDecodeError as e:
+            parse_errors.append(f"Non-strict parse: {e.msg} at line {e.lineno}")
+        
+        # Approach 3: Fix common issues
+        try:
+            fixed_json = cleaned_json.replace("'", '"')
+            fixed_json = re.sub(r',\s*([}\]])', r'\1', fixed_json)
+            return json.loads(fixed_json), None
+        except json.JSONDecodeError as e:
+            parse_errors.append(f"Fixed parse: {e.msg} at line {e.lineno}")
+        
+        return None, parse_errors
 
     @staticmethod
     def check_miny(urls):
+        """Check MINY template"""
         issues = []
-        pat = r"\$\{y\}|\$\{ym1\}|\$\{yp1\}|\$\{y2\}|\$\{ym2\}"
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        miny_pattern = r"\$\{y\}|\$\{ym1\}|\$\{yp1\}|\$\{y2\}|\$\{ym2\}"
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"\{miny", u):
-                if not re.search(r"\$\{miny=\:\d{4}\}", u) or not re.search(pat, u):
-                    issues.append({"type": "MINY Template Incorrect", "url_index": i, "url": u})
+            has_miny_bracket = bool(re.search(r"\{miny", url))
+            has_miny_syntax = bool(re.search(r"\$\{miny=\:\d{4}\}", url))
+            has_miny_template = bool(re.search(miny_pattern, url))
+            
+            if has_miny_bracket and (not has_miny_syntax or not has_miny_template):
+                issues.append({
+                    "type": "MINY Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
     def check_epp(urls):
+        """Check EPP template"""
         issues = []
-        pat = r"\$\{p\}|\$\{pm1\}|\$\{pp1\}|\$\{stm1\}|\$\{st\}"
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        epp_pattern = r"\$\{p\}|\$\{pm1\}|\$\{pp1\}|\$\{stm1\}|\$\{st\}"
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"\{epp", u):
-                if not re.search(r"\$\{epp=\:\d{1,2}\}", u) or not re.search(pat, u):
-                    issues.append({"type": "EPP Template Incorrect", "url_index": i, "url": u})
+            has_epp_bracket = bool(re.search(r"\{epp", url))
+            has_epp_syntax = bool(re.search(r"\$\{epp=\:\d{1,2}\}", url))
+            has_epp_template = bool(re.search(epp_pattern, url))
+            
+            if has_epp_bracket and (not has_epp_syntax or not has_epp_template):
+                issues.append({
+                    "type": "EPP Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
     def check_xpath(urls):
+        """Check XPATH template"""
         issues = []
-        pat = (
-            r"\$\{xpath=\:\<\{//.*\};\{\@.*\}\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{\@.*\};\{.*\};;\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{.*\};;\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{\@.*\};\{.*\};\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{.*\};\>\}.*xml"
-            r"|\$\{xpath=\:\<\{//.*\};\{\@.*\};;\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{.\};;\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{\@.*\};\{.*\};;;\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{\@.*\};;;\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{.\};\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{\@.*\}\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{\@.*\};\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};\{.\}\>\}"
-            r"|\$\{xpath=\:\<\{//tr\};\{td\[4\]\};\{td\[2\]\};\{td\[1\]\}\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};{.*\};\{.*\};\{.*}.*\>\}"
-            r"|\$\{xpath=\:\<\{//.*\};{.*\};\{.*\};;.*\>\}"
-        )
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        xpath_pattern = r"\$\{xpath=\:\<\{//.*\};\{\@.*\}\>\}|\$\{xpath=\:\<\{//.*\};\{\@.*\};\{.*\};;\>\}|\$\{xpath=\:\<\{//.*\};\{.*\};;\>\}|\$\{xpath=\:\<\{//.*\};\{\@.*\};\{.*\};\>\}|\$\{xpath=\:\<\{//.*\};\{.*\};\>\}.*xml|\$\{xpath=\:\<\{//.*\};\{\@.*\};;\>\}|\$\{xpath=\:\<\{//.*\};\{.\};;\>\}|\$\{xpath=\:\<\{//.*\};\{\@.*\};\{.*\};;;\>\}|\$\{xpath=\:\<\{//.*\};\{\@.*\};;;\>\}|\$\{xpath=\:\<\{//.*\};\{.\};\>\}|\$\{xpath=\:\<\{//.*\};\{\@.*\}\>\}|\$\{xpath=\:\<\{//.*\};\{\@.*\};\>\}|\$\{xpath=\:\<\{//.*\};\{.\}\>\}|\$\{xpath=\:\<\{//tr\};\{td\[4\]\};\{td\[2\]\};\{td\[1\]\}\>\}|\$\{xpath=\:\<\{//.*\};{.*\};\{.*\};\{.*}.*\>\}|\$\{xpath=\:\<\{//.*\};{.*\};\{.*\};;.*\>\}"
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"\{xpath", u) and not re.search(pat, u):
-                issues.append({"type": "XPATH Template Incorrect", "url_index": i, "url": u})
+            has_xpath = bool(re.search(r"\{xpath", url))
+            has_valid_xpath = bool(re.search(xpath_pattern, url))
+            
+            if has_xpath and not has_valid_xpath:
+                issues.append({
+                    "type": "XPATH Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
     def check_onclick(urls):
+        """Check ONCLICK template"""
         issues = []
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        onclick_pattern = r'\$\{onclick_var=\:\".*\"\}'
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"\{onclick", u) and not re.search(r'\$\{onclick_var=\:\".*\"\}', u):
-                issues.append({"type": "ONCLICK Template Incorrect", "url_index": i, "url": u})
+            has_onclick = bool(re.search(r"\{onclick", url))
+            has_valid_onclick = bool(re.search(onclick_pattern, url))
+            
+            if has_onclick and not has_valid_onclick:
+                issues.append({
+                    "type": "ONCLICK Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
     def check_jsarg(urls):
+        """Check JSARG template"""
         issues = []
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        jsarg_pattern = r'\$\{jsarg=\:\d\}'
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"jsarg", u) and not re.search(r'\$\{jsarg=\:\d\}', u):
-                issues.append({"type": "JSARG Template Incorrect", "url_index": i, "url": u})
+            has_jsarg = bool(re.search(r"jsarg", url))
+            has_valid_jsarg = bool(re.search(jsarg_pattern, url))
+            
+            if has_jsarg and not has_valid_jsarg:
+                issues.append({
+                    "type": "JSARG Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
-    def check_json_template(urls):
+    def check_json(urls):
+        """Check JSON template"""
         issues = []
-        jp = (
-            r"\$\{json=\:\<\{cp\:\:"
-            r"|\$\{json=\:\<\".*\";\".*\";\".*\";\".*\"\>\}"
-            r"|\$\{json=\:\<\".*\";\".*\"\>\}"
-            r"|\$\{json=\:\<\".*\"; \".*\"\>\}"
-            r"|\$\{json=\:\<\".*\";\".*\";\>\}"
-            r"|\$\{json=\:\<\{tr\:\:"
-            r"|\$\{json=\:\<\".*\";\".*\";\".*\";\>\}"
-            r"|\$\{json=\:\<\".*\";\".*\";;\>\}"
-            r"|\$\{json=\:\<\".*\";\".*\";;;\>\}"
-            r"|GetFinancialReportListResult"
-            r"|GetPresentationListResult"
-            r"|GetEventListResult"
-            r"|\$\{json=\:\<\".*\";\".*\";\".*\";\".*\";\".*\";\".*\"\|\>\}"
-            r"|\$\{json=\:\<\".*\";\".*\";\".*\";\".*\";\".*\";\".*\"\|\".*;\".*\";.*\>\}"
-        )
-        mp = (
-            r'json\:xhr\:|json\:uepost\:xhr\:|json\:jspost\:xhr\:'
-            r'|json\:curl\:xhr\:|json\:curl\:|appid'
-            r'|json\:\$\{url\}|json\:xhr\:uepost\:'
-        )
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        json_pattern = r"\$\{json=\:\<\{cp\:\:|\$\{json=\:\<\".*\";\".*\";\".*\";\".*\"\>\}|\$\{json=\:\<\".*\";\".*\"\>\}|\$\{json=\:\<\".*\"; \".*\"\>\}|\$\{json=\:\<\".*\";\".*\";\>\}|\$\{json=\:\<\{tr\:\:|\$\{json=\:\<\".*\";\".*\";\".*\";\>\}|\$\{json=\:\<\".*\";\".*\";;\>\}|\$\{json=\:\<\".*\";\".*\";;;\>\}|GetFinancialReportListResult|GetPresentationListResult|GetEventListResult|\$\{json=\:\<\".*\";\".*\";\".*\";\".*\";\".*\";\".*\"\|\>\}|\$\{json=\:\<\".*\";\".*\";\".*\";\".*\";\".*\";\".*\"\|\".*;\".*\";.*\>\}"
+        mid_pattern = r'json\:xhr\:|json\:uepost\:xhr\:|json\:jspost\:xhr\:|json\:curl\:xhr\:|json\:curl\:|appid|json\:\$\{url\}|json\:xhr\:uepost\:'
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"\{json=", u):
-                if not re.search(jp, u) or not re.search(mp, u):
-                    issues.append({"type": "JSON Template Incorrect", "url_index": i, "url": u})
-            elif re.search(r"\{json_", u):
-                if not re.search(r"\$\{json_data_load=\:1\}|\$\{json_data_load=\:True\}", u):
-                    issues.append({"type": "JSON Data Load Incorrect", "url_index": i, "url": u})
-            elif re.search(r"\{js_", u):
-                if not re.search(r"\$\{js_json=\:1\}", u):
-                    issues.append({"type": "JS JSON Incorrect", "url_index": i, "url": u})
+                
+            has_json_eq = bool(re.search(r"\{json=", url))
+            has_valid_json = bool(re.search(json_pattern, url))
+            has_mid = bool(re.search(mid_pattern, url))
+            
+            has_json_data = bool(re.search(r"\{json_", url))
+            has_valid_json_data = bool(re.search(r"\$\{json_data_load=\:1\}|\$\{json_data_load=\:True\}", url))
+            
+            has_js = bool(re.search(r"\{js_", url))
+            has_valid_js = bool(re.search(r"\$\{js_json=\:1\}", url))
+            
+            if has_json_eq and (not has_valid_json or not has_mid):
+                issues.append({
+                    "type": "JSON Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
+            elif has_json_data and not has_valid_json_data:
+                issues.append({
+                    "type": "JSON Data Load Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
+            elif has_js and not has_valid_js:
+                issues.append({
+                    "type": "JS JSON Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
     def check_baseurl(urls):
+        """Check BASEURL template"""
         issues = []
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        baseurl_pattern = r"\$\{baseurl=\:\".*\"\}|\$\{full_baseurl=\:True\}"
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"\{baseurl", u):
-                if not re.search(r"\$\{baseurl=\:\".*\"\}|\$\{full_baseurl=\:True\}", u):
-                    issues.append({"type": "BASEURL Template Incorrect", "url_index": i, "url": u})
+            has_baseurl = bool(re.search(r"\{baseurl", url))
+            has_valid_baseurl = bool(re.search(baseurl_pattern, url))
+            
+            if has_baseurl and not has_valid_baseurl:
+                issues.append({
+                    "type": "BASEURL Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
     def check_windowflag(urls):
+        """Check Window Flag template"""
         issues = []
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        window_pattern = r"\$\{window_flag_regex=\:\".*\"\}|\$\{window_flag=\:True\}"
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if re.search(r"\{window", u):
-                if not re.search(r"\$\{window_flag_regex=\:\".*\"\}|\$\{window_flag=\:True\}", u):
-                    issues.append({"type": "Window Flag Incorrect", "url_index": i, "url": u})
+            has_window = bool(re.search(r"\{window", url))
+            has_valid_window = bool(re.search(window_pattern, url))
+            
+            if has_window and not has_valid_window:
+                issues.append({
+                    "type": "Window Flag Template Incorrect",
+                    "url_index": idx,
+                    "url": url
+                })
         return issues
 
     @staticmethod
     def check_regex(urls):
+        """Check Regex format"""
         issues = []
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str) or len(u) < 4:
+        regex_pattern = r"^ev|^df|^cp|^if"
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str) or len(url) < 4:
                 continue
-            if re.search(r"^ev|^df|^cp|^if", u):
-                has_up = bool(re.search(r"[A-Z]", u))
-                has_esc = bool(re.search(r"\\[A-Z]|A\-Z", u))
-                if len(u) >= 11 and has_up and not has_esc:
-                    issues.append({"type": "Regex - Uppercase not escaped", "url_index": i, "url": u})
-                elif len(u) >= 11 and u[2] != ":":
-                    issues.append({"type": "Regex - Missing colon", "url_index": i, "url": u})
+            
+            has_regex = bool(re.search(regex_pattern, url))
+            if has_regex:
+                has_uppercase = bool(re.search(r"[A-Z]", url))
+                has_escaped_uppercase = bool(re.search(r"\\[A-Z]|A\-Z", url))
+                
+                if len(url) >= 11 and has_uppercase and not has_escaped_uppercase:
+                    issues.append({
+                        "type": "Regex Incorrect - Uppercase not escaped",
+                        "url_index": idx,
+                        "url": url
+                    })
+                elif len(url) >= 11 and url[2] != ":":
+                    issues.append({
+                        "type": "Regex Incorrect - Missing colon at position 2",
+                        "url_index": idx,
+                        "url": url
+                    })
         return issues
 
     @staticmethod
     def check_http(urls):
+        """Check HTTP URL format"""
         issues = []
-        skip = '|'.join([r'^df', r'^if', r'^ev', r'^cp'])
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str) or len(u) <= 5:
+        keywords = [r'^df', r'^if', r'^ev', r'^cp']
+        pattern = '|'.join(keywords)
+    
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str) or len(url) <= 5:
                 continue
-            if re.search(skip, u, re.IGNORECASE):
+            
+            is_special = bool(re.search(pattern, url, re.IGNORECASE))
+            if is_special:
                 continue
-            has_http = "http" in u.lower()
-            has_multi = bool(re.search(r"http.*http", u, re.IGNORECASE))
-            if has_multi:
-                cleaned = re.sub(r'\$\{baseurl\=\:\"http', '', u, count=1, flags=re.IGNORECASE)
-                has_multi = bool(re.search(r"http.*http", cleaned, re.IGNORECASE))
+            
+            has_http = "http" in url.lower()
+            has_multiple_http = bool(re.search(r"http.*http", url, re.IGNORECASE))
+            
+            # If multiple http found, check if first one is in baseurl template
+            if has_multiple_http:
+                # Pattern to match ${baseurl} with http inside it
+                baseurl_pattern = r'\$\{baseurl\=\:\"http'
+                
+                # Remove the baseurl template and check if there's still multiple http
+                url_without_baseurl = re.sub(baseurl_pattern, '', url, count=1, flags=re.IGNORECASE)
+                
+                # Re-check for multiple http after removing baseurl
+                has_multiple_http = bool(re.search(r"http.*http", url_without_baseurl, re.IGNORECASE))
+            
+            has_newline = bool(re.search(r"\n", url))
+            
             if not has_http:
-                issues.append({"type": "Missing HTTP/HTTPS", "url_index": i, "url": u})
-            elif has_multi:
-                issues.append({"type": "Multiple HTTP in URL", "url_index": i, "url": u})
-            elif re.search(r"\n", u):
-                issues.append({"type": "Newline in URL", "url_index": i, "url": u})
+                issues.append({
+                    "type": "Missing HTTP/HTTPS",
+                    "url_index": idx,
+                    "url": url
+                })
+            elif has_multiple_http:
+                issues.append({
+                    "type": "Multiple HTTP in URL",
+                    "url_index": idx,
+                    "url": url
+                })
+            elif has_newline:
+                issues.append({
+                    "type": "Newline character in URL",
+                    "url_index": idx,
+                    "url": url
+                })
+        
         return issues
 
     @staticmethod
     def check_brackets(urls):
+        """Check bracket matching"""
         issues = []
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            if u.count("{") != u.count("}"):
+            
+            open_count = url.count("{")
+            close_count = url.count("}")
+            
+            if open_count != close_count:
                 issues.append({
-                    "type": "Mismatched Brackets", "url_index": i, "url": u,
-                    "details": f"Open: {u.count('{')}, Close: {u.count('}')}"
+                    "type": "Mismatched Brackets {}",
+                    "url_index": idx,
+                    "url": url,
+                    "details": f"Open: {open_count}, Close: {close_count}"
                 })
         return issues
 
     @staticmethod
     def check_duplicates(urls):
+        """Check for duplicate URLs"""
         issues = []
-        m = {}
-        for i, u in enumerate(urls, 1):
-            if not isinstance(u, str):
+        valid_urls = []
+        url_map = {}
+        
+        for idx, url in enumerate(urls, 1):
+            if not isinstance(url, str):
                 continue
-            c = u.strip()
-            if len(c) <= 3 or c.lower() in ('nan', 'none', 'null', 'n/a', ''):
+            
+            url_clean = url.strip()
+            
+            if len(url_clean) <= 3:
                 continue
-            m.setdefault(c, []).append(i)
-        for u, idx in m.items():
-            if len(idx) > 1:
+            
+            if url_clean.lower() in ['nan', 'none', 'null', 'n/a', '']:
+                continue
+            
+            valid_urls.append((idx, url_clean))
+            
+            if url_clean in url_map:
+                url_map[url_clean].append(idx)
+            else:
+                url_map[url_clean] = [idx]
+        
+        for url, indices in url_map.items():
+            if len(indices) > 1:
                 issues.append({
-                    "type": "Duplicate URL", "url_indices": idx,
-                    "url": u, "occurrences": len(idx)
+                    "type": "Duplicate URL",
+                    "url_indices": indices,
+                    "url": url,
+                    "occurrences": len(indices)
                 })
+        
         return issues
 
     @staticmethod
     def check_metadata(data):
+        """Check metadata fields"""
         issues = []
-        agent = str(data.get("status", "") or "").strip().lower()
-        ct = str(data.get("case_type", "") or "").strip().lower()
-        proj = str(data.get("project", "") or "").strip()
-        rs = str(data.get("research_status", "") or "").strip().lower()
-        ia = str(data.get("issue_area", "") or "").strip()
-        fs = str(data.get("final_status", "") or "").strip()
-        irsp = str(data.get("irsp_provider", "") or "").strip()
-        aurls = data.get("after_save_pageurls", [])
-
-        is_active = bool(re.search(r"verified$|manual|escalated_to_technology_team", agent))
-        has_active = bool(re.search(r"verified|manual|escalated|website_is_down|internal_review", agent))
-
-        if is_active and not ct:
-            issues.append({"type": "Metadata Error", "field": "case_type",
-                           "message": "No Case Type with active Agent status"})
-        if any("curl:" in str(u) for u in aurls if isinstance(u, str)):
-            if ct != "cookie_case":
-                issues.append({"type": "Metadata Error", "field": "case_type",
-                               "message": "curl: found but case_type not cookie_case"})
-        if any("s3.amazonaws.com" in str(u) for u in aurls if isinstance(u, str)):
-            if ct != "manual_solution_webpage_generated":
-                issues.append({"type": "Metadata Error", "field": "case_type",
-                               "message": "S3 URL but case_type not manual_solution_webpage_generated"})
-        if rs == "not_fixed" and proj != "QA":
-            issues.append({"type": "Metadata Error", "field": "research_status",
-                           "message": "not_fixed but project not QA"})
-        if (not ia and agent not in ["internal_review", "miscellaneous"]
-                and proj not in ["New Ticker", "QA"]):
-            issues.append({"type": "Metadata Error", "field": "issue_area",
-                           "message": "Issue Area missing"})
-        if not aurls and has_active:
-            issues.append({"type": "Metadata Error", "field": "after_save_pageurls",
-                           "message": "Active status but no URLs"})
-        if irsp.lower() == "q4web" and not has_active:
-            issues.append({"type": "Metadata Error", "field": "irsp_provider",
-                           "message": "Q4Web with non-active status"})
-        wd = [u for u in aurls if isinstance(u, str) and re.search(r"wd:", u)]
-        if wd and ct == "direct":
-            issues.append({"type": "Metadata Error", "field": "case_type",
-                           "message": "WD in URLs but case_type=direct"})
-        if ct == "direct" and aurls and URLAuditor.urls_contain_templates(aurls):
-            issues.append({"type": "Metadata Error", "field": "case_type",
-                           "message": "Direct but templates found in URLs"})
-        if is_active:
-            if not ia:
-                issues.append({"type": "Metadata Error", "field": "issue_area",
-                               "message": "Issue Area blank"})
-            if not fs:
-                issues.append({"type": "Metadata Error", "field": "final_status",
-                               "message": "Final Status blank"})
-        has_cp = any(isinstance(u, str) and u.strip().startswith("cp:") for u in aurls)
-        if has_cp and irsp:
-            issues.append({"type": "Metadata Error", "field": "irsp_provider",
-                           "message": f"cp: in URLs but irsp_provider='{irsp}'"})
-        f3 = aurls[:3] if len(aurls) >= 3 else aurls
-        has_text = any(isinstance(u, str) and u.strip().lower().startswith("text:") for u in f3)
-        if has_text and irsp != "Q4Web":
-            issues.append({"type": "Metadata Error", "field": "irsp_provider",
-                           "message": f"text: in first 3 URLs but irsp_provider='{irsp}'"})
+        
+        if data.get("verified") and not data.get("case_type"):
+            issues.append({
+                "type": "Metadata Error",
+                "field": "case_type",
+                "message": "Case is verified but case_type is missing"
+            })
+        
+        has_curl = any("curl:" in str(url) for url in data.get("after_save_pageurls", []) if isinstance(url, str))
+        if has_curl and data.get("case_type") != "cookie_case":
+            issues.append({
+                "type": "Metadata Error",
+                "field": "case_type",
+                "message": "URLs contain 'curl:' but case_type is not 'cookie_case'"
+            })
+        
+        has_s3 = any("s3.amazonaws.com" in str(url) for url in data.get("after_save_pageurls", []) if isinstance(url, str))
+        if has_s3 and data.get("case_type") != "manual_solution_webpage_generated":
+            issues.append({
+                "type": "Metadata Error",
+                "field": "case_type",
+                "message": "S3 URL found but case_type is not 'manual_solution_webpage_generated'"
+            })
+        
         return issues
 
     @classmethod
     def audit_urls(cls, data):
+        """Run all audit checks"""
         urls = data.get("after_save_pageurls", [])
+        
+        if not urls:
+            return {"status": "No URLs found", "total_urls": 0, "issues_found": 0, "issues": []}
+        
         issues = []
-        if urls:
-            for fn in [cls.check_miny, cls.check_epp, cls.check_xpath,
-                       cls.check_onclick, cls.check_jsarg, cls.check_json_template,
-                       cls.check_baseurl, cls.check_windowflag, cls.check_regex,
-                       cls.check_http, cls.check_brackets, cls.check_duplicates]:
-                issues.extend(fn(urls))
+        issues.extend(cls.check_miny(urls))
+        issues.extend(cls.check_epp(urls))
+        issues.extend(cls.check_xpath(urls))
+        issues.extend(cls.check_onclick(urls))
+        issues.extend(cls.check_jsarg(urls))
+        issues.extend(cls.check_json(urls))
+        issues.extend(cls.check_baseurl(urls))
+        issues.extend(cls.check_windowflag(urls))
+        issues.extend(cls.check_regex(urls))
+        issues.extend(cls.check_http(urls))
+        issues.extend(cls.check_brackets(urls))
+        issues.extend(cls.check_duplicates(urls))
         issues.extend(cls.check_metadata(data))
-        return {"status": "Complete", "total_urls": len(urls),
-                "issues_found": len(issues), "issues": issues}
+        
+        return {
+            "status": "Complete",
+            "total_urls": len(urls),
+            "issues_found": len(issues),
+            "issues": issues
+        }
 
 
-def display_url_wrapped(url):
+def display_url_wrapped(url, max_length=80):
+    """Display URL with text wrapping"""
     return f'<div class="url-text">{url}</div>'
 
-
-def make_clickable(url):
-    """Make a URL into a clickable HTML link."""
-    short = url if len(url) <= 80 else url[:77] + "..."
-    return f'<a href="{url}" target="_blank" title="{url}">{short}</a>'
-
-
-def build_missing_df(missing_rows):
-    """Build DataFrame from missing rows list with guaranteed column names."""
-    if not missing_rows:
-        return pd.DataFrame(columns=["domain", "seed_url", "missing_url", "depth"])
-    return pd.DataFrame(missing_rows)
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
 def main():
+    # Header
     st.title("🔍 URL Audit Tool")
     st.markdown("---")
-
+    
+    # Instructions
     with st.expander("ℹ️ Instructions", expanded=False):
         st.markdown("""
-        1. **Paste JSON** → **Run Audit** for template/metadata checks
-        2. **Check for Missing URLs** → Crawls ALL unique domain roots
-           at depth 10 with 50 concurrent threads
-        3. Missing URLs shown in a **table with clickable links** + CSV/JSON download
-
-        **Seed URL = domain root only** (e.g. `https://www.company.com`)
+        ### How to use this tool:
+        1. **Paste your JSON data** in the text area below
+        2. Click **Run Audit** button
+        3. Review the results
+        
+        ### JSON Format Expected:
+        ```json
+        {
+            "id": "12345",
+            "as_company_id": "TICKER",
+            "after_save_pageurls": ["url1", "url2", ...],
+            "verified": true,
+            "case_type": "cookie_case"
+        }
+        ```
         """)
-
-    if 'audit_result_data' not in st.session_state:
-        st.session_state.audit_result_data = None
-    if 'audit_json_data' not in st.session_state:
-        st.session_state.audit_json_data = None
+    
+    # Initialize session state
+    if 'audit_results' not in st.session_state:
+        st.session_state.audit_results = None
+    if 'audit_data' not in st.session_state:
+        st.session_state.audit_data = None
     if 'clear_trigger' not in st.session_state:
         st.session_state.clear_trigger = False
-    if 'crawl_summary' not in st.session_state:
-        st.session_state.crawl_summary = None
-    if 'missing_df' not in st.session_state:
-        st.session_state.missing_df = None
-
+    
+    # JSON Input Section
     st.subheader("📝 JSON Input")
-    dv = "" if st.session_state.clear_trigger else st.session_state.get('last_input', '')
+    
+    # Set default value for text area
+    default_value = "" if st.session_state.clear_trigger else st.session_state.get('last_input', '')
+    
     json_input = st.text_area(
-        "Paste JSON:", height=300,
-        placeholder='{\n  "status": "verified",\n  "after_save_pageurls": [...]\n}',
-        value=dv, key="json_ta"
+        "Paste your JSON data here:",
+        height=300,
+        placeholder='{\n  "id": "12345",\n  "as_company_id": "TICKER",\n  "after_save_pageurls": [...]\n}',
+        value=default_value,
+        key="json_text_area"
     )
+    
+    # Store current input
     if json_input and not st.session_state.clear_trigger:
         st.session_state.last_input = json_input
+    
+    # Reset clear trigger
     if st.session_state.clear_trigger:
         st.session_state.clear_trigger = False
-
-    b1, b2, b3 = st.columns([2, 2, 2])
-    with b1:
-        run_btn = st.button("🚀 Run Audit", type="primary", use_container_width=True)
-    with b2:
-        clr_btn = st.button("🗑️ Clear All", use_container_width=True)
-    with b3:
-        if st.session_state.audit_result_data is not None:
-            st.download_button(
-                "📥 Audit Report",
-                data=json.dumps(st.session_state.audit_result_data, indent=2),
-                file_name=f"audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json", use_container_width=True
+    
+    # Buttons
+    col1, col2, col3, col4 = st.columns([2, 2, 2, 6])
+    
+    with col1:
+        run_button = st.button("🚀 Run Audit", type="primary", use_container_width=True)
+    
+    with col2:
+        clear_button = st.button("🗑️ Clear", use_container_width=True)
+    
+    with col3:
+        if st.session_state.audit_results:
+            download_button = st.download_button(
+                label="📥 Download Report",
+                data=json.dumps(st.session_state.audit_results, indent=2),
+                file_name=f"audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
             )
-
-    if clr_btn:
-        st.session_state.audit_result_data = None
-        st.session_state.audit_json_data = None
-        st.session_state.crawl_summary = None
-        st.session_state.missing_df = None
+    
+    # Clear functionality
+    if clear_button:
+        st.session_state.audit_results = None
+        st.session_state.audit_data = None
         st.session_state.last_input = ""
         st.session_state.clear_trigger = True
         st.rerun()
-
-    if run_btn:
+    
+    # Run Audit
+    if run_button:
         if not json_input.strip():
-            st.warning("⚠️ Paste JSON first!")
+            st.warning("⚠️ Please paste JSON data first!")
         else:
-            with st.spinner("🔄 Auditing..."):
-                data, errs = URLAuditor.parse_json(json_input)
+            with st.spinner("🔄 Processing audit..."):
+                # Parse JSON
+                data, parse_errors = URLAuditor.parse_json(json_input)
+                
                 if data is None:
-                    st.error("❌ JSON parse failed")
-                    with st.expander("Errors"):
-                        for e in errs:
-                            st.text(e)
+                    st.error("❌ Failed to parse JSON")
+                    with st.expander("View Parse Errors"):
+                        for error in parse_errors:
+                            st.text(error)
+                    st.info("💡 Please ensure your JSON is properly formatted.")
                 else:
-                    st.session_state.audit_result_data = URLAuditor.audit_urls(data)
-                    st.session_state.audit_json_data = data
-                    st.session_state.crawl_summary = None
-                    st.session_state.missing_df = None
-                    st.success("✅ Done!")
-
-    # =====================================================================
-    # AUDIT RESULTS
-    # =====================================================================
-    if (st.session_state.audit_result_data is not None
-            and st.session_state.audit_json_data is not None):
-
-        data = st.session_state.audit_json_data
-        res = st.session_state.audit_result_data
-
-        if not isinstance(res, dict) or "issues_found" not in res:
-            st.error("Audit results corrupted. Please run audit again.")
-            st.session_state.audit_result_data = None
-            st.session_state.audit_json_data = None
-            st.rerun()
-            return
-
-        st.markdown("---")
-        ticker = data.get("ticker", data.get("as_company_id", "?"))
-        cid = data.get("as_company_id", data.get("id", "?"))
-        st.header(f"📊 {ticker} ({cid})")
-        st.caption(f"Agent Status: **{data.get('status', 'N/A')}**")
-
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric("URLs", res.get("total_urls", 0))
-        with m2:
-            st.metric("Issues", res.get("issues_found", 0))
-        with m3:
-            st.metric("Status", "✅ PASS" if res.get("issues_found", 0) == 0 else "❌ FAIL")
-
-        with st.expander("📋 Fields", expanded=False):
-            f1, f2 = st.columns(2)
-            with f1:
-                for f in ['status', 'case_type', 'project', 'issue_area']:
-                    st.write(f"**{f}:** {data.get(f, 'N/A')}")
-            with f2:
-                for f in ['final_status', 'irsp_provider', 'research_status', 'verified']:
-                    st.write(f"**{f}:** {data.get(f, 'N/A')}")
-
-        if res.get("issues_found", 0) == 0:
-            st.markdown('<div class="success-box"><h3>✓ No Issues!</h3></div>',
-                        unsafe_allow_html=True)
-        else:
-            st.subheader(f"⚠️ {res['issues_found']} Issues")
-            by_type = {}
-            for iss in res.get("issues", []):
-                by_type.setdefault(iss["type"], []).append(iss)
-            for itype, ilist in by_type.items():
-                with st.expander(f"**{itype}** ({len(ilist)})", expanded=True):
-                    for i, iss in enumerate(ilist, 1):
-                        st.markdown(f"**#{i}:**")
-                        if 'url_index' in iss:
-                            st.write(f"📍 Index: {iss['url_index']}")
-                        if 'url_indices' in iss:
-                            st.write(f"📍 {iss['url_indices']} ({iss['occurrences']}x)")
-                        if 'field' in iss:
-                            st.write(f"🏷️ `{iss['field']}` — {iss['message']}")
-                        if 'url' in iss:
-                            st.markdown(display_url_wrapped(iss['url']), unsafe_allow_html=True)
-                        if 'details' in iss:
-                            st.info(iss['details'])
-                        if i < len(ilist):
-                            st.markdown("---")
-            st.table([{"Issue": t, "Count": len(l)} for t, l in by_type.items()])
-
-        # =============================================================
-        # MISSING URL CHECK
-        # =============================================================
-        st.markdown("---")
-        st.header("🌐 Missing URL Check")
-
-        after_urls = data.get("after_save_pageurls", [])
-        domain_map = DomainUtil.extract_unique_domain_roots(after_urls)
-
-        if not domain_map:
-            st.warning("⚠️ No HTTP URLs found in after_save_pageurls.")
-        else:
-            st.markdown(f"**Unique domains found: {len(domain_map)}**")
-            domain_display = []
-            for norm_domain, root_url in sorted(domain_map.items()):
-                domain_display.append({
-                    "Domain": norm_domain,
-                    "Seed URL (root)": root_url,
-                })
-            st.table(domain_display)
-
-            with st.expander("⚙️ Crawl Settings", expanded=False):
-                s1, s2, s3 = st.columns(3)
-                with s1:
-                    depth = st.slider("Max Depth", 1, 15, 10, key="cd")
-                with s2:
-                    pages = st.slider("Max Pages", 100, 2000, 1000, 100, key="cp")
-                with s3:
-                    workers = st.slider("Threads", 10, 100, 50, 5, key="cw")
-
-            crawl_btn = st.button(
-                "🔎 Check for Missing URLs", type="secondary",
-                use_container_width=True
-            )
-
-            if crawl_btn:
-                crawler = ConcurrentDomainCrawler(
-                    max_depth=depth, max_pages=pages, max_workers=workers
-                )
-                prog = st.progress(0)
-                stat = st.empty()
-
-                def cb(crawled, queued, discovered, d, msg):
-                    prog.progress(min(crawled / pages, 1.0))
-                    stat.markdown(
-                        f"**Crawled:** {crawled} | **Queued:** {queued} | "
-                        f"**Found:** {discovered} | **Depth:** {d}"
-                    )
-
-                with st.spinner(
-                    f"🕷️ Crawling {len(domain_map)} domain root(s) with "
-                    f"{workers} threads, depth {depth}..."
-                ):
-                    discovered = crawler.crawl(domain_map, progress_callback=cb)
-
-                prog.progress(1.0)
-                stat.markdown(
-                    f"✅ **Crawl complete!** Found **{len(discovered)}** URLs "
-                    f"across **{len(domain_map)}** domain(s)"
-                )
-
-                regex_pats = URLMatcher.extract_regex_patterns(after_urls)
-                missing_rows = []
-                covered_count = 0
-
-                for url, info in sorted(discovered.items()):
-                    covered, reason = URLMatcher.is_url_covered(url, after_urls, regex_pats)
-                    if covered:
-                        covered_count += 1
+                    # Validate required fields
+                    if "after_save_pageurls" not in data:
+                        st.error("❌ JSON must contain 'after_save_pageurls' field!")
                     else:
-                        missing_rows.append({
-                            "domain": info["domain"],
-                            "seed_url": info["seed"],
-                            "missing_url": url,
-                            "depth": info["depth"],
-                        })
-
-                st.session_state.crawl_summary = {
-                    "total_discovered": len(discovered),
-                    "covered_count": covered_count,
-                    "missing_count": len(missing_rows),
-                }
-                st.session_state.missing_df = build_missing_df(missing_rows)
-
-            # ==========================================================
-            # DISPLAY CRAWL RESULTS
-            # ==========================================================
-            if st.session_state.crawl_summary is not None:
-                cs = st.session_state.crawl_summary
-
-                if not isinstance(cs, dict) or "total_discovered" not in cs:
-                    st.warning("Crawl data corrupted. Please re-run.")
-                    st.session_state.crawl_summary = None
-                    st.session_state.missing_df = None
-                else:
-                    st.markdown("---")
-                    st.subheader("📊 Crawl Results")
-
-                    x1, x2, x3 = st.columns(3)
-                    with x1:
-                        st.metric("Total Found", cs["total_discovered"])
-                    with x2:
-                        st.metric("Already Covered", cs["covered_count"])
-                    with x3:
-                        st.metric("Missing", cs["missing_count"])
-
-                    df = st.session_state.missing_df
-
-                    if df is not None and not df.empty and len(df) > 0:
-
-                        st.markdown(
-                            f"### 🔴 {len(df)} URLs on Domain but "
-                            f"Missing from After URLs"
-                        )
-                        st.markdown("*Click any URL to open in new tab*")
-
-                        # Build display version with clickable links
-                        # Use actual column names from the DataFrame
-                        cols = list(df.columns)
-
-                        display_df = df.copy()
-
-                        # Apply clickable links to URL columns
-                        for col in cols:
-                            if 'url' in col.lower():
-                                display_df[col] = display_df[col].apply(make_clickable)
-
-                        # Rename columns for display
-                        rename_map = {
-                            "domain": "Domain",
-                            "seed_url": "Seed URL",
-                            "missing_url": "Missing URL",
-                            "depth": "Depth",
-                        }
-                        display_df = display_df.rename(columns=rename_map)
-                        df_renamed = df.rename(columns=rename_map)
-
-                        # Sort options — use renamed columns
-                        display_cols = list(display_df.columns)
-                        sort_col = st.selectbox(
-                            "Sort by:", display_cols, index=0, key="sort_col"
-                        )
-
-                        # Sort using original data, apply to display
-                        sorted_idx = df_renamed.sort_values(sort_col).index
-                        display_df = display_df.loc[sorted_idx].reset_index(drop=True)
-                        display_df.index = display_df.index + 1
-                        display_df.index.name = "#"
-
-                        st.markdown(
-                            display_df.to_html(escape=False, index=True),
-                            unsafe_allow_html=True
-                        )
-
-                        # Domain breakdown
-                        st.markdown("### 📊 Missing by Domain")
-                        dc = df["domain"].value_counts().reset_index()
-                        dc.columns = ["Domain", "Missing URLs"]
-                        st.table(dc)
-
-                        # Depth breakdown
-                        st.markdown("### 📊 Missing by Depth")
-                        dpc = df["depth"].value_counts().sort_index().reset_index()
-                        dpc.columns = ["Depth", "Count"]
-                        st.bar_chart(dpc.set_index("Depth"))
-
-                        # Downloads — use original df with clean column names
-                        download_df = df.rename(columns=rename_map)
-                        st.markdown("### 📥 Download")
-                        d1, d2 = st.columns(2)
-                        with d1:
-                            st.download_button(
-                                "📥 CSV",
-                                data=download_df.to_csv(index=False),
-                                file_name=f"missing_urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                mime="text/csv",
-                                use_container_width=True
-                            )
-                        with d2:
-                            st.download_button(
-                                "📥 JSON",
-                                data=download_df.to_json(orient="records", indent=2),
-                                file_name=f"missing_urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                                mime="application/json",
-                                use_container_width=True
-                            )
-
-                    elif cs["missing_count"] == 0:
-                        st.markdown("""
-                            <div class="success-box">
-                                <h3>✓ No Missing URLs!</h3>
-                                <p>All discovered URLs are covered by
-                                after_save_pageurls (exact or regex match).</p>
-                            </div>
-                        """, unsafe_allow_html=True)
-
+                        # Run audit
+                        audit_results = URLAuditor.audit_urls(data)
+                        st.session_state.audit_results = audit_results
+                        st.session_state.audit_data = data
+                        st.success("✅ Audit completed successfully!")
+    
+    # Display Results
+    if st.session_state.audit_results:
+        st.markdown("---")
+        
+        data = st.session_state.audit_data
+        results = st.session_state.audit_results
+        
+        # Header Information
+        ticker = data.get("as_company_id", "Unknown")
+        company_id = data.get("id", "Unknown")
+        
+        st.header(f"📊 Audit Results for {ticker} (ID: {company_id})")
+        
+        # Summary Cards
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Total URLs", results["total_urls"])
+        
+        with col2:
+            st.metric("Issues Found", results["issues_found"])
+        
+        with col3:
+            status = "✅ PASS" if results["issues_found"] == 0 else "❌ FAIL"
+            st.metric("Status", status)
+        
+        st.markdown("---")
+        
+        # Results Display
+        if results["issues_found"] == 0:
+            st.markdown("""
+                <div class="success-box">
+                    <h3>✓ No Issues Found!</h3>
+                    <p>All URLs passed validation. All templates and formats are correct.</p>
+                </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.subheader(f"⚠️ Issues Found: {results['issues_found']}")
+            
+            # Group issues by type
+            issues_by_type = {}
+            for issue in results["issues"]:
+                issue_type = issue["type"]
+                if issue_type not in issues_by_type:
+                    issues_by_type[issue_type] = []
+                issues_by_type[issue_type].append(issue)
+            
+            # Display issues grouped by type
+            for issue_type, issues in issues_by_type.items():
+                with st.expander(f"**{issue_type}** ({len(issues)} issues)", expanded=True):
+                    for i, issue in enumerate(issues, 1):
+                        st.markdown(f"**Issue #{i}:**")
+                        
+                        if 'url_index' in issue:
+                            st.write(f"📍 **URL Index:** {issue['url_index']}")
+                        elif 'url_indices' in issue:
+                            st.write(f"📍 **URL Indices:** {issue['url_indices']}")
+                            st.write(f"🔢 **Total Occurrences:** {issue['occurrences']}")
+                        
+                        if 'field' in issue:
+                            st.write(f"🏷️ **Field:** `{issue['field']}`")
+                            st.write(f"💬 **Message:** {issue['message']}")
+                        
+                        if 'url' in issue:
+                            st.markdown("**🔗 URL:**")
+                            st.markdown(display_url_wrapped(issue['url']), unsafe_allow_html=True)
+                        
+                        if 'details' in issue:
+                            st.info(f"ℹ️ {issue['details']}")
+                        
+                        if i < len(issues):
+                            st.markdown("---")
+            
+            # Summary Table
+            st.markdown("### 📋 Issue Summary")
+            issue_summary = []
+            for issue_type, issues in issues_by_type.items():
+                issue_summary.append({
+                    "Issue Type": issue_type,
+                    "Count": len(issues)
+                })
+            
+            st.table(issue_summary)
+    
+    # Footer
     st.markdown("---")
-    st.markdown(
-        '<div style="text-align:center;color:#666;padding:20px;">'
-        'URL Audit Tool v3.1</div>',
-        unsafe_allow_html=True
-    )
+    st.markdown("""
+        <div style='text-align: center; color: #666; padding: 20px;'>
+            <p>URL Audit Tool v1.0 | Built with Streamlit</p>
+        </div>
+    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
