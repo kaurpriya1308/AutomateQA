@@ -2,16 +2,14 @@ import streamlit as st
 import json
 import re
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import pandas as pd
 
-# Page configuration
 st.set_page_config(
     page_title="URL Audit Tool",
     page_icon="🔍",
@@ -58,6 +56,64 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# DOMAIN UTILITY
+# =============================================================================
+class DomainUtil:
+    """Extract unique domain roots from URLs."""
+
+    @staticmethod
+    def get_domain_root(url):
+        """
+        Extract domain root from a full URL.
+        https://www.company.com/investors/reports?page=1 → https://www.company.com
+        https://ir.company.co.uk/events/2024 → https://ir.company.co.uk
+        """
+        try:
+            parsed = urlparse(url.strip())
+            if not parsed.scheme or not parsed.netloc:
+                return None
+            # Rebuild with just scheme + netloc (domain root)
+            root = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
+            return root
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_normalized_domain(url):
+        """Get domain without www for comparison."""
+        try:
+            parsed = urlparse(url.strip())
+            return parsed.netloc.lower().replace('www.', '')
+        except Exception:
+            return None
+
+    @staticmethod
+    def extract_unique_domain_roots(urls):
+        """
+        From a list of URLs, extract unique domain roots.
+        Input:
+            https://www.company.com/investors/reports
+            https://www.company.com/events
+            https://ir.company.com/filings
+        Output:
+            {'company.com': 'https://www.company.com',
+             'ir.company.com': 'https://ir.company.com'}
+        """
+        domain_map = {}  # normalized_domain -> root_url
+        for url in urls:
+            if not isinstance(url, str):
+                continue
+            url = url.strip()
+            if not url.startswith('http'):
+                continue
+            root = DomainUtil.get_domain_root(url)
+            norm = DomainUtil.get_normalized_domain(url)
+            if root and norm and norm not in domain_map:
+                domain_map[norm] = root
+        return domain_map
 
 
 # =============================================================================
@@ -187,24 +243,16 @@ class ConcurrentDomainCrawler:
                             new_urls.append((norm, depth + 1))
         return new_urls
 
-    def crawl(self, after_urls, progress_callback=None):
+    def crawl(self, domain_roots, progress_callback=None):
         """
-        Crawl ALL domains found in after_urls.
-        Returns dict: {url: {"seed": ..., "depth": ..., "domain": ...}}
+        Crawl from domain roots only.
+        domain_roots: dict {normalized_domain: root_url}
+            e.g. {'company.com': 'https://www.company.com',
+                   'ir.company.com': 'https://ir.company.com'}
+        Returns dict: {url: {"seed": root_url, "depth": int, "domain": str}}
         """
-        seed_urls = []
-        allowed_domains = set()
-
-        for url in after_urls:
-            if not isinstance(url, str):
-                continue
-            url = url.strip()
-            if url.startswith('http'):
-                parsed = urlparse(url)
-                domain = parsed.netloc.lower().replace('www.', '')
-                allowed_domains.add(domain)
-                norm = self._normalize_url(url)
-                seed_urls.append(norm)
+        allowed_domains = set(domain_roots.keys())
+        seed_urls = list(domain_roots.values())
 
         if not seed_urls:
             return {}
@@ -214,16 +262,19 @@ class ConcurrentDomainCrawler:
         all_discovered = {}
 
         current_level = []
-        for url in seed_urls:
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower().replace('www.', '')
-            all_discovered[url] = {"seed": url, "depth": 0, "domain": domain}
-            current_level.append((url, 0))
+        for norm_domain, root_url in domain_roots.items():
+            normalized = self._normalize_url(root_url)
+            all_discovered[normalized] = {
+                "seed": root_url,
+                "depth": 0,
+                "domain": norm_domain
+            }
+            current_level.append((normalized, 0))
 
         if progress_callback:
             progress_callback(
                 0, len(seed_urls), len(all_discovered), 0,
-                f"Starting: {len(seed_urls)} seeds, {len(allowed_domains)} domain(s)"
+                f"Starting: {len(seed_urls)} domain root(s)"
             )
 
         for depth_level in range(self.max_depth + 1):
@@ -254,13 +305,9 @@ class ConcurrentDomainCrawler:
                             if new_url not in all_discovered:
                                 parsed = urlparse(new_url)
                                 domain = parsed.netloc.lower().replace('www.', '')
-                                seed = next(
-                                    (s for s in seed_urls
-                                     if urlparse(s).netloc.lower().replace('www.', '') == domain),
-                                    seed_urls[0]
-                                )
+                                root = domain_roots.get(domain, seed_urls[0])
                                 all_discovered[new_url] = {
-                                    "seed": seed,
+                                    "seed": root,
                                     "depth": new_depth,
                                     "domain": domain
                                 }
@@ -287,27 +334,11 @@ class ConcurrentDomainCrawler:
 class URLMatcher:
 
     @staticmethod
-    def extract_http_urls(urls):
-        return [
-            u.strip() for u in urls
-            if isinstance(u, str) and u.strip().startswith('http')
-        ]
-
-    @staticmethod
-    def extract_all_domains(urls):
-        domains = set()
-        for u in urls:
-            if isinstance(u, str) and u.strip().startswith('http'):
-                d = urlparse(u.strip()).netloc.lower().replace('www.', '')
-                if d:
-                    domains.add(d)
-        return domains
-
-    @staticmethod
     def extract_regex_patterns(urls):
         return [
             u.strip() for u in urls
-            if isinstance(u, str) and re.match(r'^(ev|cp|df|if):', u.strip(), re.IGNORECASE)
+            if isinstance(u, str)
+            and re.match(r'^(ev|cp|df|if):', u.strip(), re.IGNORECASE)
         ]
 
     @staticmethod
@@ -329,7 +360,9 @@ class URLMatcher:
             if not regex_part:
                 continue
             try:
-                if re.search(regex_part, parsed.path) or re.search(regex_part, discovered_url):
+                if re.search(regex_part, parsed.path):
+                    return True, f"Matched regex: {pat_str[:60]}"
+                if re.search(regex_part, discovered_url):
                     return True, f"Matched regex: {pat_str[:60]}"
             except re.error:
                 continue
@@ -633,7 +666,7 @@ class URLAuditor:
                 issues.append({
                     "type": "Mismatched Brackets",
                     "url_index": i, "url": u,
-                    "details": f"{{ {u.count('{')}, }} {u.count('}')}"
+                    "details": f"Open: {u.count('{')}, Close: {u.count('}')}"
                 })
         return issues
 
@@ -748,8 +781,7 @@ class URLAuditor:
                 })
 
         has_cp = any(
-            isinstance(u, str) and u.strip().startswith("cp:")
-            for u in aurls
+            isinstance(u, str) and u.strip().startswith("cp:") for u in aurls
         )
         if has_cp and irsp:
             issues.append({
@@ -808,12 +840,17 @@ def main():
     with st.expander("ℹ️ Instructions", expanded=False):
         st.markdown("""
         1. **Paste JSON** → **Run Audit** for template/metadata checks
-        2. **Check for Missing URLs** → Crawls ALL domains from after URLs
+        2. **Check for Missing URLs** → Crawls ALL unique domain roots from after URLs
            at depth 10 with 50 concurrent threads
         3. Missing URLs shown in a **table with clickable links** + CSV/JSON download
+
+        **Seed URL logic:**
+        - Extracts unique domains from all after_save_pageurls
+        - Uses only the domain root as seed (e.g. `https://www.company.com`)
+        - NOT the full URL path (e.g. NOT `https://www.company.com/investors/reports`)
         """)
 
-    # Session state — use distinct keys
+    # Session state
     if 'audit_result_data' not in st.session_state:
         st.session_state.audit_result_data = None
     if 'audit_json_data' not in st.session_state:
@@ -891,7 +928,6 @@ def main():
         data = st.session_state.audit_json_data
         res = st.session_state.audit_result_data
 
-        # Safety check
         if not isinstance(res, dict) or "issues_found" not in res:
             st.error("Audit results corrupted. Please run audit again.")
             st.session_state.audit_result_data = None
@@ -942,7 +978,9 @@ def main():
                         if 'url_index' in iss:
                             st.write(f"📍 Index: {iss['url_index']}")
                         if 'url_indices' in iss:
-                            st.write(f"📍 {iss['url_indices']} ({iss['occurrences']}x)")
+                            st.write(
+                                f"📍 {iss['url_indices']} ({iss['occurrences']}x)"
+                            )
                         if 'field' in iss:
                             st.write(f"🏷️ `{iss['field']}` — {iss['message']}")
                         if 'url' in iss:
@@ -965,19 +1003,22 @@ def main():
         st.header("🌐 Missing URL Check")
 
         after_urls = data.get("after_save_pageurls", [])
-        all_http = URLMatcher.extract_http_urls(after_urls)
-        all_domains = URLMatcher.extract_all_domains(after_urls)
 
-        if not all_http:
-            st.warning("⚠️ No HTTP URLs in after_save_pageurls.")
+        # Extract unique domain roots
+        domain_map = DomainUtil.extract_unique_domain_roots(after_urls)
+
+        if not domain_map:
+            st.warning("⚠️ No HTTP URLs found in after_save_pageurls.")
         else:
-            st.markdown(
-                f"**Domains to crawl ({len(all_domains)}):** "
-                f"`{'`, `'.join(sorted(all_domains))}`"
-            )
-            st.markdown(
-                f"**Seed URLs:** {len(all_http)} HTTP URLs from after_save_pageurls"
-            )
+            # Display domain roots
+            st.markdown(f"**Unique domains found: {len(domain_map)}**")
+            domain_table = []
+            for norm_domain, root_url in sorted(domain_map.items()):
+                domain_table.append({
+                    "Domain": norm_domain,
+                    "Seed URL (root)": root_url,
+                })
+            st.table(domain_table)
 
             with st.expander("⚙️ Crawl Settings", expanded=False):
                 s1, s2, s3 = st.columns(3)
@@ -1009,15 +1050,15 @@ def main():
                     )
 
                 with st.spinner(
-                    f"🕷️ Crawling {len(all_domains)} domain(s) with "
+                    f"🕷️ Crawling {len(domain_map)} domain root(s) with "
                     f"{workers} threads, depth {depth}..."
                 ):
-                    discovered = crawler.crawl(after_urls, progress_callback=cb)
+                    discovered = crawler.crawl(domain_map, progress_callback=cb)
 
                 prog.progress(1.0)
                 stat.markdown(
                     f"✅ **Crawl complete!** Found **{len(discovered)}** URLs "
-                    f"across **{len(all_domains)}** domain(s)"
+                    f"across **{len(domain_map)}** domain(s)"
                 )
 
                 # Compare against after URLs
@@ -1034,9 +1075,9 @@ def main():
                     else:
                         missing_rows.append({
                             "Domain": info["domain"],
-                            "Source Seed URL": info["seed"],
+                            "Seed URL": info["seed"],
                             "Missing URL": url,
-                            "Depth Found": info["depth"],
+                            "Depth": info["depth"],
                         })
 
                 st.session_state.crawl_summary = {
@@ -1070,7 +1111,7 @@ def main():
                     with x2:
                         st.metric("Already Covered", cs["covered_count"])
                     with x3:
-                        st.metric("Missing from After URLs", cs["missing_count"])
+                        st.metric("Missing", cs["missing_count"])
 
                     if (st.session_state.missing_df is not None
                             and not st.session_state.missing_df.empty):
@@ -1078,8 +1119,8 @@ def main():
                         df = st.session_state.missing_df
 
                         st.markdown(
-                            f"### 🔴 {len(df)} URLs Found on Domain "
-                            f"but Missing from After URLs"
+                            f"### 🔴 {len(df)} URLs on Domain but "
+                            f"Missing from After URLs"
                         )
                         st.markdown("*Click any URL to open in new tab*")
 
@@ -1091,21 +1132,23 @@ def main():
                             )
 
                         display_df = df.copy()
-                        display_df["Missing URL"] = display_df["Missing URL"].apply(
-                            make_link
-                        )
-                        display_df["Source Seed URL"] = display_df[
-                            "Source Seed URL"
+                        display_df["Missing URL"] = display_df[
+                            "Missing URL"
+                        ].apply(make_link)
+                        display_df["Seed URL"] = display_df[
+                            "Seed URL"
                         ].apply(make_link)
 
                         sort_col = st.selectbox(
                             "Sort by:",
-                            ["Depth Found", "Domain", "Missing URL"],
+                            ["Depth", "Domain", "Missing URL"],
                             index=0, key="sort_col"
                         )
 
                         sorted_idx = df.sort_values(sort_col).index
-                        display_df = display_df.loc[sorted_idx].reset_index(drop=True)
+                        display_df = display_df.loc[sorted_idx].reset_index(
+                            drop=True
+                        )
                         display_df.index = display_df.index + 1
                         display_df.index.name = "#"
 
@@ -1115,45 +1158,45 @@ def main():
                         )
 
                         # Domain breakdown
-                        st.markdown("### 📊 Missing URLs by Domain")
-                        domain_counts = (
-                            df["Domain"].value_counts().reset_index()
-                        )
-                        domain_counts.columns = ["Domain", "Missing URLs"]
-                        st.table(domain_counts)
+                        st.markdown("### 📊 Missing by Domain")
+                        dc = df["Domain"].value_counts().reset_index()
+                        dc.columns = ["Domain", "Missing URLs"]
+                        st.table(dc)
 
                         # Depth breakdown
-                        st.markdown("### 📊 Missing URLs by Depth")
-                        depth_counts = (
-                            df["Depth Found"]
+                        st.markdown("### 📊 Missing by Depth")
+                        dpc = (
+                            df["Depth"]
                             .value_counts()
                             .sort_index()
                             .reset_index()
                         )
-                        depth_counts.columns = ["Depth", "Count"]
-                        st.bar_chart(depth_counts.set_index("Depth"))
+                        dpc.columns = ["Depth", "Count"]
+                        st.bar_chart(dpc.set_index("Depth"))
 
                         # Downloads
                         st.markdown("### 📥 Download")
                         d1, d2 = st.columns(2)
                         with d1:
                             st.download_button(
-                                "📥 Download CSV",
+                                "📥 CSV",
                                 data=df.to_csv(index=False),
                                 file_name=(
                                     f"missing_urls_"
-                                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                                    f".csv"
                                 ),
                                 mime="text/csv",
                                 use_container_width=True
                             )
                         with d2:
                             st.download_button(
-                                "📥 Download JSON",
+                                "📥 JSON",
                                 data=df.to_json(orient="records", indent=2),
                                 file_name=(
                                     f"missing_urls_"
-                                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                                    f".json"
                                 ),
                                 mime="application/json",
                                 use_container_width=True
@@ -1163,8 +1206,8 @@ def main():
                         st.markdown("""
                             <div class="success-box">
                                 <h3>✓ No Missing URLs!</h3>
-                                <p>All discovered URLs on the domain(s) are covered
-                                by after_save_pageurls (exact match or regex).</p>
+                                <p>All discovered URLs are covered by
+                                after_save_pageurls (exact or regex match).</p>
                             </div>
                         """, unsafe_allow_html=True)
 
