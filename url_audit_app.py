@@ -69,8 +69,7 @@ class DomainUtil:
             parsed = urlparse(url.strip())
             if not parsed.scheme or not parsed.netloc:
                 return None
-            root = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
-            return root
+            return urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
         except Exception:
             return None
 
@@ -227,50 +226,40 @@ class ConcurrentDomainCrawler:
     def crawl(self, domain_roots, progress_callback=None):
         allowed_domains = set(domain_roots.keys())
         seed_urls = list(domain_roots.values())
-
         if not seed_urls:
             return {}
 
         self._pages_crawled = 0
         visited = set()
         all_discovered = {}
-
         current_level = []
+
         for norm_domain, root_url in domain_roots.items():
             normalized = self._normalize_url(root_url)
             all_discovered[normalized] = {
-                "seed": root_url,
-                "depth": 0,
-                "domain": norm_domain
+                "seed": root_url, "depth": 0, "domain": norm_domain
             }
             current_level.append((normalized, 0))
 
         if progress_callback:
-            progress_callback(
-                0, len(seed_urls), len(all_discovered), 0,
-                f"Starting: {len(seed_urls)} domain root(s)"
-            )
+            progress_callback(0, len(seed_urls), len(all_discovered), 0,
+                              f"Starting: {len(seed_urls)} domain root(s)")
 
         for depth_level in range(self.max_depth + 1):
             if not current_level or self._pages_crawled >= self.max_pages:
                 break
 
             batch_size = max(1, len(current_level) // self.max_workers)
-            batches = [
-                current_level[i:i + batch_size]
-                for i in range(0, len(current_level), batch_size)
-            ]
-
+            batches = [current_level[i:i + batch_size]
+                       for i in range(0, len(current_level), batch_size)]
             next_level = []
 
             with ThreadPoolExecutor(
                 max_workers=min(self.max_workers, max(len(batches), 1))
             ) as ex:
                 futures = [
-                    ex.submit(
-                        self._crawl_batch, batch, allowed_domains,
-                        visited, self._make_session()
-                    )
+                    ex.submit(self._crawl_batch, batch, allowed_domains,
+                              visited, self._make_session())
                     for batch in batches
                 ]
                 for f in as_completed(futures):
@@ -281,9 +270,7 @@ class ConcurrentDomainCrawler:
                                 domain = parsed.netloc.lower().replace('www.', '')
                                 root = domain_roots.get(domain, seed_urls[0])
                                 all_discovered[new_url] = {
-                                    "seed": root,
-                                    "depth": new_depth,
-                                    "domain": domain
+                                    "seed": root, "depth": new_depth, "domain": domain
                                 }
                                 next_level.append((new_url, new_depth))
                     except Exception:
@@ -291,12 +278,11 @@ class ConcurrentDomainCrawler:
 
             if progress_callback:
                 progress_callback(
-                    self._pages_crawled, len(next_level),
-                    len(all_discovered), depth_level,
+                    self._pages_crawled, len(next_level), len(all_discovered),
+                    depth_level,
                     f"Depth {depth_level} done | Crawled: {self._pages_crawled} | "
                     f"Next: {len(next_level)}"
                 )
-
             current_level = next_level
 
         return all_discovered
@@ -689,13 +675,17 @@ def display_url_wrapped(url):
     return f'<div class="url-text">{url}</div>'
 
 
-# =============================================================================
-# Column name constants — used everywhere consistently
-# =============================================================================
-COL_DOMAIN = "Domain"
-COL_SEED = "Seed URL"
-COL_MISSING = "Missing URL"
-COL_DEPTH = "Depth"
+def make_clickable(url):
+    """Make a URL into a clickable HTML link."""
+    short = url if len(url) <= 80 else url[:77] + "..."
+    return f'<a href="{url}" target="_blank" title="{url}">{short}</a>'
+
+
+def build_missing_df(missing_rows):
+    """Build DataFrame from missing rows list with guaranteed column names."""
+    if not missing_rows:
+        return pd.DataFrame(columns=["domain", "seed_url", "missing_url", "depth"])
+    return pd.DataFrame(missing_rows)
 
 
 # =============================================================================
@@ -712,7 +702,7 @@ def main():
            at depth 10 with 50 concurrent threads
         3. Missing URLs shown in a **table with clickable links** + CSV/JSON download
 
-        **Seed URL = domain root only** (e.g. `https://www.company.com`, NOT full path)
+        **Seed URL = domain root only** (e.g. `https://www.company.com`)
         """)
 
     if 'audit_result_data' not in st.session_state:
@@ -857,13 +847,13 @@ def main():
             st.warning("⚠️ No HTTP URLs found in after_save_pageurls.")
         else:
             st.markdown(f"**Unique domains found: {len(domain_map)}**")
-            domain_table = []
+            domain_display = []
             for norm_domain, root_url in sorted(domain_map.items()):
-                domain_table.append({
-                    COL_DOMAIN: norm_domain,
+                domain_display.append({
+                    "Domain": norm_domain,
                     "Seed URL (root)": root_url,
                 })
-            st.table(domain_table)
+            st.table(domain_display)
 
             with st.expander("⚙️ Crawl Settings", expanded=False):
                 s1, s2, s3 = st.columns(3)
@@ -915,10 +905,10 @@ def main():
                         covered_count += 1
                     else:
                         missing_rows.append({
-                            COL_DOMAIN: info["domain"],
-                            COL_SEED: info["seed"],
-                            COL_MISSING: url,
-                            COL_DEPTH: info["depth"],
+                            "domain": info["domain"],
+                            "seed_url": info["seed"],
+                            "missing_url": url,
+                            "depth": info["depth"],
                         })
 
                 st.session_state.crawl_summary = {
@@ -926,11 +916,7 @@ def main():
                     "covered_count": covered_count,
                     "missing_count": len(missing_rows),
                 }
-
-                if missing_rows:
-                    st.session_state.missing_df = pd.DataFrame(missing_rows)
-                else:
-                    st.session_state.missing_df = None
+                st.session_state.missing_df = build_missing_df(missing_rows)
 
             # ==========================================================
             # DISPLAY CRAWL RESULTS
@@ -954,10 +940,9 @@ def main():
                     with x3:
                         st.metric("Missing", cs["missing_count"])
 
-                    if (st.session_state.missing_df is not None
-                            and not st.session_state.missing_df.empty):
+                    df = st.session_state.missing_df
 
-                        df = st.session_state.missing_df
+                    if df is not None and not df.empty and len(df) > 0:
 
                         st.markdown(
                             f"### 🔴 {len(df)} URLs on Domain but "
@@ -965,24 +950,35 @@ def main():
                         )
                         st.markdown("*Click any URL to open in new tab*")
 
-                        def make_link(url):
-                            short = url if len(url) <= 80 else url[:77] + "..."
-                            return (
-                                f'<a href="{url}" target="_blank" '
-                                f'title="{url}">{short}</a>'
-                            )
+                        # Build display version with clickable links
+                        # Use actual column names from the DataFrame
+                        cols = list(df.columns)
 
                         display_df = df.copy()
-                        display_df[COL_MISSING] = display_df[COL_MISSING].apply(make_link)
-                        display_df[COL_SEED] = display_df[COL_SEED].apply(make_link)
 
+                        # Apply clickable links to URL columns
+                        for col in cols:
+                            if 'url' in col.lower():
+                                display_df[col] = display_df[col].apply(make_clickable)
+
+                        # Rename columns for display
+                        rename_map = {
+                            "domain": "Domain",
+                            "seed_url": "Seed URL",
+                            "missing_url": "Missing URL",
+                            "depth": "Depth",
+                        }
+                        display_df = display_df.rename(columns=rename_map)
+                        df_renamed = df.rename(columns=rename_map)
+
+                        # Sort options — use renamed columns
+                        display_cols = list(display_df.columns)
                         sort_col = st.selectbox(
-                            "Sort by:",
-                            [COL_DEPTH, COL_DOMAIN, COL_MISSING],
-                            index=0, key="sort_col"
+                            "Sort by:", display_cols, index=0, key="sort_col"
                         )
 
-                        sorted_idx = df.sort_values(sort_col).index
+                        # Sort using original data, apply to display
+                        sorted_idx = df_renamed.sort_values(sort_col).index
                         display_df = display_df.loc[sorted_idx].reset_index(drop=True)
                         display_df.index = display_df.index + 1
                         display_df.index.name = "#"
@@ -992,22 +988,26 @@ def main():
                             unsafe_allow_html=True
                         )
 
+                        # Domain breakdown
                         st.markdown("### 📊 Missing by Domain")
-                        dc = df[COL_DOMAIN].value_counts().reset_index()
-                        dc.columns = [COL_DOMAIN, "Missing URLs"]
+                        dc = df["domain"].value_counts().reset_index()
+                        dc.columns = ["Domain", "Missing URLs"]
                         st.table(dc)
 
+                        # Depth breakdown
                         st.markdown("### 📊 Missing by Depth")
-                        dpc = df[COL_DEPTH].value_counts().sort_index().reset_index()
-                        dpc.columns = [COL_DEPTH, "Count"]
-                        st.bar_chart(dpc.set_index(COL_DEPTH))
+                        dpc = df["depth"].value_counts().sort_index().reset_index()
+                        dpc.columns = ["Depth", "Count"]
+                        st.bar_chart(dpc.set_index("Depth"))
 
+                        # Downloads — use original df with clean column names
+                        download_df = df.rename(columns=rename_map)
                         st.markdown("### 📥 Download")
                         d1, d2 = st.columns(2)
                         with d1:
                             st.download_button(
                                 "📥 CSV",
-                                data=df.to_csv(index=False),
+                                data=download_df.to_csv(index=False),
                                 file_name=f"missing_urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                                 mime="text/csv",
                                 use_container_width=True
@@ -1015,7 +1015,7 @@ def main():
                         with d2:
                             st.download_button(
                                 "📥 JSON",
-                                data=df.to_json(orient="records", indent=2),
+                                data=download_df.to_json(orient="records", indent=2),
                                 file_name=f"missing_urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                                 mime="application/json",
                                 use_container_width=True
@@ -1033,7 +1033,7 @@ def main():
     st.markdown("---")
     st.markdown(
         '<div style="text-align:center;color:#666;padding:20px;">'
-        'URL Audit Tool v3.0</div>',
+        'URL Audit Tool v3.1</div>',
         unsafe_allow_html=True
     )
 
