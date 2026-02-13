@@ -41,8 +41,6 @@ st.markdown("""
 
 class URLAuditor:
 
-    # These are the ACTUAL template keywords that mean "not direct"
-    # Only these should trigger the "Direct but templates found" error
     TEMPLATE_KEYWORDS = [
         r'json:',
         r'baseurl',
@@ -109,7 +107,6 @@ class URLAuditor:
 
     @staticmethod
     def urls_contain_templates(urls):
-        """Check if any URL contains actual template keywords."""
         for u in urls:
             if not isinstance(u, str):
                 continue
@@ -374,25 +371,20 @@ class URLAuditor:
             issues.append({"type": "Metadata Error", "field": "case_type",
                            "message": "WD in URLs but case_type=direct"})
 
-        # Direct case_type check — only flag if actual template keywords found
-        # NOT ev:/cp:/df:/if: regex patterns — those are fine with direct
         if ct == "direct" and aurls and URLAuditor.urls_contain_templates(aurls):
-            # Find which template keywords were found for the error message
             found_keywords = []
             for u in aurls:
                 if not isinstance(u, str):
                     continue
                 for kw in URLAuditor.TEMPLATE_KEYWORDS:
                     if re.search(kw, u, re.IGNORECASE):
-                        # Clean up regex escapes for display
                         display_kw = kw.replace(r'\{', '{').replace(r'\:', ':')
                         if display_kw not in found_keywords:
                             found_keywords.append(display_kw)
             kw_list = ", ".join(found_keywords[:5])
             issues.append({
                 "type": "Metadata Error", "field": "case_type",
-                "message": f"Direct case_type but templates found in URLs. "
-                           f"Templates detected: {kw_list}"
+                "message": f"Direct case_type but templates found: {kw_list}"
             })
 
         if is_active:
@@ -440,6 +432,14 @@ def display_url_wrapped(url):
     return f'<div class="url-text">{url}</div>'
 
 
+def clear_all():
+    """Callback to clear everything including the text area widget."""
+    st.session_state.audit_result_data = None
+    st.session_state.audit_json_data = None
+    # Directly set the widget key to empty string
+    st.session_state.json_ta = ""
+
+
 def main():
     st.title("🔍 URL Audit Tool")
     st.markdown("---")
@@ -472,39 +472,27 @@ def main():
         and are allowed with `direct` case_type.
         """)
 
-    # Session state
+    # Initialize session state
     if 'audit_result_data' not in st.session_state:
         st.session_state.audit_result_data = None
     if 'audit_json_data' not in st.session_state:
         st.session_state.audit_json_data = None
-    if 'clear_trigger' not in st.session_state:
-        st.session_state.clear_trigger = False
 
-    # JSON Input
+    # JSON Input — key="json_ta" is directly manipulated by clear_all()
     st.subheader("📝 JSON Input")
-
-    # Handle clear: use callback to reset
-    if st.session_state.clear_trigger:
-        default_val = ""
-        st.session_state.clear_trigger = False
-    else:
-        default_val = st.session_state.get('last_input', '')
-
     json_input = st.text_area(
         "Paste JSON:", height=300,
         placeholder='{\n  "status": "verified",\n  "after_save_pageurls": [...]\n}',
-        value=default_val, key="json_ta"
+        key="json_ta"
     )
-
-    if json_input:
-        st.session_state.last_input = json_input
 
     # Buttons
     b1, b2, b3 = st.columns([2, 2, 2])
     with b1:
         run_btn = st.button("🚀 Run Audit", type="primary", use_container_width=True)
     with b2:
-        clr_btn = st.button("🗑️ Clear All", use_container_width=True)
+        # on_click callback clears BEFORE the rerun, so widget value is empty
+        st.button("🗑️ Clear All", use_container_width=True, on_click=clear_all)
     with b3:
         if st.session_state.audit_result_data is not None:
             st.download_button(
@@ -513,14 +501,6 @@ def main():
                 file_name=f"audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json", use_container_width=True
             )
-
-    # Clear — reset everything and rerun
-    if clr_btn:
-        st.session_state.audit_result_data = None
-        st.session_state.audit_json_data = None
-        st.session_state.last_input = ""
-        st.session_state.clear_trigger = True
-        st.rerun()
 
     # Run Audit
     if run_btn:
