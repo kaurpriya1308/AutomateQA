@@ -61,7 +61,6 @@ class URLAuditor:
         r'\{json=',
         r'\{json_',
         r'\{js_',
-        r'\{maxp',
     ]
 
     @staticmethod
@@ -142,15 +141,18 @@ class URLAuditor:
 
     @staticmethod
     def check_maxp(urls):
-        """Check MAXP template — ${maxp=:N} where N is any number."""
+        """Check that ${maxp=:N} is NOT present — it's for testing only, must not be saved."""
         issues = []
         for i, u in enumerate(urls, 1):
             if not isinstance(u, str):
                 continue
-            has_maxp = bool(re.search(r"\{maxp", u))
-            has_valid_maxp = bool(re.search(r"\$\{maxp=\:\d+\}", u))
-            if has_maxp and not has_valid_maxp:
-                issues.append({"type": "MAXP Template Incorrect", "url_index": i, "url": u})
+            if re.search(r"\{maxp", u, re.IGNORECASE):
+                issues.append({
+                    "type": "MAXP Found - Must Be Removed",
+                    "url_index": i,
+                    "url": u,
+                    "details": "${maxp=:N} is for testing only. It must not be saved in after URLs."
+                })
         return issues
 
     @staticmethod
@@ -263,10 +265,6 @@ class URLAuditor:
 
     @staticmethod
     def _get_regex_body(url):
-        """
-        Extract the regex body after the prefix (ev:, cp:, df:, if:).
-        Returns the part after the colon, e.g. 'cp:/some/regex' -> '/some/regex'
-        """
         m = re.match(r'^(ev|cp|df|if):(.*)', url, re.IGNORECASE)
         if m:
             return m.group(2)
@@ -274,40 +272,20 @@ class URLAuditor:
 
     @staticmethod
     def _is_weak_regex(regex_body):
-        """
-        Check if a regex is weak — meaning any alternative (split by |)
-        is just a single word (no path separators, no special regex chars).
-        
-        Weak examples:
-            /news              → single word after slash
-            /reports           → single word after slash
-            news|reports       → each part is single word
-            /investor|/annual  → each part is single path segment
-            
-        Strong examples:
-            /investor-relations/press-releases  → multi-segment
-            /news/.*press                       → has wildcard
-            /reports(?!(.*(pdf)))               → has lookahead
-            /ir/annual-report                   → multi-part path
-        """
         if not regex_body or len(regex_body.strip()) < 3:
             return True, "Regex body too short"
 
         body = regex_body.strip()
-
-        # Split by | to check each alternative
         alternatives = body.split('|')
-
         weak_parts = []
+
         for alt in alternatives:
             alt = alt.strip()
             if not alt:
                 continue
 
-            # Remove leading slash for analysis
             clean = alt.lstrip('/')
 
-            # Skip if it has complex regex features — not weak
             has_complex = bool(re.search(
                 r'\.\*|\.\+|\?[!<=(]|\[.*\]|\{.*\}|\\d|\\w|\\s|\(\?',
                 clean
@@ -315,12 +293,8 @@ class URLAuditor:
             if has_complex:
                 continue
 
-            # Check if this alternative is just one simple word
-            # A "word" = only letters, digits, hyphens, underscores (no slashes, no dots except extension)
-            # Remove trailing optional parts like /?
             clean_check = re.sub(r'/?\??$', '', clean)
 
-            # Single word: no path separators, no meaningful regex structure
             if re.match(r'^[a-zA-Z0-9_-]+$', clean_check):
                 weak_parts.append(alt)
 
@@ -331,23 +305,14 @@ class URLAuditor:
 
     @staticmethod
     def check_regex(urls):
-        """
-        Check regex URLs for:
-        1. Uppercase not escaped
-        2. Missing colon at position 2
-        3. Weak regex (single word alternatives)
-        4. Too many of same type (max 3 each of ev:, cp:, df:, if:)
-        """
         issues = []
 
-        # --- Per-URL checks ---
         for i, u in enumerate(urls, 1):
             if not isinstance(u, str) or len(u) < 4:
                 continue
             if not re.search(r"^ev|^df|^cp|^if", u):
                 continue
 
-            # Uppercase check
             has_up = bool(re.search(r"[A-Z]", u))
             has_esc = bool(re.search(r"\\[A-Z]|A\-Z", u))
             if len(u) >= 11 and has_up and not has_esc:
@@ -355,15 +320,12 @@ class URLAuditor:
                     "type": "Regex - Uppercase not escaped",
                     "url_index": i, "url": u
                 })
-
-            # Colon check
             elif len(u) >= 11 and u[2] != ":":
                 issues.append({
                     "type": "Regex - Missing colon",
                     "url_index": i, "url": u
                 })
 
-            # Weak regex check
             regex_body = URLAuditor._get_regex_body(u)
             if regex_body:
                 is_weak, weak_reason = URLAuditor._is_weak_regex(regex_body)
@@ -374,7 +336,6 @@ class URLAuditor:
                         "details": f"Regex should match multi-word paths. {weak_reason}"
                     })
 
-        # --- Count check: max 3 of each type ---
         type_counts = {"ev": [], "cp": [], "df": [], "if": []}
         for i, u in enumerate(urls, 1):
             if not isinstance(u, str) or len(u) < 4:
@@ -570,7 +531,6 @@ def display_url_wrapped(url):
 
 
 def clear_all():
-    """Callback to clear everything including the text area widget."""
     st.session_state.audit_result_data = None
     st.session_state.audit_json_data = None
     st.session_state.json_ta = ""
@@ -588,30 +548,24 @@ def main():
         3. Review results
 
         ### Checks performed:
-        
+
         **Template checks:**
-        MINY, EPP, MAXP, XPATH, ONCLICK, JSARG, JSON, BASEURL, Window Flag
-        
+        MINY, EPP, XPATH, ONCLICK, JSARG, JSON, BASEURL, Window Flag
+
+        **Forbidden in saved URLs:**
+        **MAXP** — `${maxp=:N}` is for testing only, must NOT be in after URLs
+
         **URL checks:**
         HTTP/HTTPS, Multiple HTTP, Brackets, Duplicates
-        
+
         **Regex checks:**
         - Uppercase not escaped
         - Missing colon after prefix
-        - **Weak regex** — each alternative in the regex must be more than a single word
+        - **Weak regex** — each alternative must be more than a single word
         - **Max 3 per type** — no more than 3 of each `ev:`, `cp:`, `df:`, `if:`
-        
+
         **Metadata checks:**
         Case type, Agent status, Issue area, Final status, IRSP provider
-
-        ### Template Keywords (triggers "not direct"):
-        `json:`, `baseurl`, `window_flag`, `wd:`, `xpath=`, `jsarg=`,
-        `split_text`, `split_flag`, `curl:`, `append_text`, `clean_links`,
-        `mark_text_null`, `hdrs`, `{miny`, `{epp`, `{maxp`, `{onclick`,
-        `{json=`, `{json_`, `{js_`
-
-        **Note:** `ev:`, `cp:`, `df:`, `if:` regex patterns are NOT templates
-        and are allowed with `direct` case_type.
         """)
 
     if 'audit_result_data' not in st.session_state:
