@@ -64,45 +64,89 @@ class URLAuditor:
     ]
 
     @staticmethod
-    def clean_json_input(text):
-        text = text.strip()
-        lines = [re.sub(r'^[\s\-]+', '', l) for l in text.split('\n') if l.strip()]
-        text = '\n'.join(lines)
-        if not text.startswith('{') and not text.startswith('['):
-            m = re.search(r'[{\[]', text)
-            if m:
-                text = text[m.start():]
-        if '{' in text:
-            s = text.index('{')
-            bc = 0
-            e = s
-            for i in range(s, len(text)):
-                if text[i] == '{':
-                    bc += 1
-                elif text[i] == '}':
-                    bc -= 1
-                    if bc == 0:
-                        e = i + 1
-                        break
-            text = text[s:e]
-        return text
-
-    @staticmethod
     def parse_json(text):
-        c = URLAuditor.clean_json_input(text)
+        """
+        Parse JSON with multiple fallback methods.
+        Handles complex URLs with ${...} templates inside strings.
+        """
+        text = text.strip()
         errs = []
-        for name, fn in [
-            ("Direct", lambda t: json.loads(t)),
-            ("Non-strict", lambda t: json.loads(t, strict=False)),
-            ("Fixed", lambda t: json.loads(
-                re.sub(r',\s*([}\]])', r'\1',
-                        re.sub(r'"\s*\n\s*"', '",\n"', t).replace("'", '"'))
-            )),
-        ]:
-            try:
-                return fn(c), None
-            except json.JSONDecodeError as e:
-                errs.append(f"{name}: {e.msg} at line {e.lineno}")
+
+        # Method 1: Direct parse — works for valid JSON
+        try:
+            return json.loads(text), None
+        except json.JSONDecodeError as e:
+            errs.append(f"Direct: {e.msg} at line {e.lineno}, col {e.colno}")
+
+        # Method 2: Non-strict parse
+        try:
+            return json.loads(text, strict=False), None
+        except json.JSONDecodeError as e:
+            errs.append(f"Non-strict: {e.msg} at line {e.lineno}, col {e.colno}")
+
+        # Method 3: Try to find the JSON object by scanning for matching braces
+        # but respecting string boundaries (skip braces inside quotes)
+        try:
+            start = text.index('{')
+            in_string = False
+            escape_next = False
+            brace_depth = 0
+            end = start
+
+            for i in range(start, len(text)):
+                ch = text[i]
+
+                if escape_next:
+                    escape_next = False
+                    continue
+
+                if ch == '\\' and in_string:
+                    escape_next = True
+                    continue
+
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+
+                if not in_string:
+                    if ch == '{':
+                        brace_depth += 1
+                    elif ch == '}':
+                        brace_depth -= 1
+                        if brace_depth == 0:
+                            end = i + 1
+                            break
+
+            extracted = text[start:end]
+            return json.loads(extracted), None
+        except (json.JSONDecodeError, ValueError) as e:
+            errs.append(f"Extract: {str(e)}")
+
+        # Method 4: Fix common issues — trailing commas, missing commas
+        try:
+            fixed = text
+            # Find JSON boundaries respecting strings
+            start_idx = fixed.index('{')
+            fixed = fixed[start_idx:]
+
+            # Remove trailing commas before } or ]
+            fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+
+            # Fix missing commas between lines ending with " and starting with "
+            fixed = re.sub(r'"\s*\n\s*"', '",\n"', fixed)
+
+            return json.loads(fixed), None
+        except (json.JSONDecodeError, ValueError) as e:
+            errs.append(f"Fixed: {str(e)}")
+
+        # Method 5: Try with single quotes replaced
+        try:
+            fixed = text.replace("'", '"')
+            fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+            return json.loads(fixed), None
+        except (json.JSONDecodeError, ValueError) as e:
+            errs.append(f"Quote-fix: {str(e)}")
+
         return None, errs
 
     @staticmethod
@@ -141,7 +185,7 @@ class URLAuditor:
 
     @staticmethod
     def check_maxp(urls):
-        """Check that ${maxp=:N} is NOT present — it's for testing only, must not be saved."""
+        """${maxp=:N} is for testing only — must NOT be in saved after URLs."""
         issues = []
         for i, u in enumerate(urls, 1):
             if not isinstance(u, str):
@@ -151,7 +195,7 @@ class URLAuditor:
                     "type": "MAXP Found - Must Be Removed",
                     "url_index": i,
                     "url": u,
-                    "details": "${maxp=:N} is for testing only. It must not be saved in after URLs."
+                    "details": "${maxp=:N} is for testing only. Must not be saved in after URLs."
                 })
         return issues
 
@@ -605,6 +649,11 @@ def main():
                     with st.expander("Errors"):
                         for e in errs:
                             st.text(e)
+                    st.info(
+                        "💡 Tip: Make sure the JSON is complete with matching "
+                        "opening and closing braces. Check for missing commas "
+                        "or unclosed strings."
+                    )
                 else:
                     st.session_state.audit_result_data = URLAuditor.audit_urls(data)
                     st.session_state.audit_json_data = data
@@ -681,7 +730,7 @@ def main():
     st.markdown("---")
     st.markdown(
         '<div style="text-align:center;color:#666;padding:20px;">'
-        'URL Audit Tool v3.3</div>',
+        'URL Audit Tool v3.4</div>',
         unsafe_allow_html=True
     )
 
