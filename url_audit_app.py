@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import re
+import requests
 from datetime import datetime
 
 st.set_page_config(
@@ -41,6 +42,13 @@ st.markdown("""
 
 class URLAuditor:
 
+    # ------------------------------------------------------------------ #
+    # TEMPLATE_KEYWORDS used for the "Direct case_type but templates"
+    # check.  ${epp and ${miny are intentionally EXCLUDED here because
+    # they ARE allowed with case_type=direct (Modification 1).
+    # {full_history} is also excluded because it is allowed with direct
+    # (Modification 2).
+    # ------------------------------------------------------------------ #
     TEMPLATE_KEYWORDS = [
         r'json:',
         r'baseurl',
@@ -55,37 +63,162 @@ class URLAuditor:
         r'clean_links',
         r'mark_text_null',
         r'hdrs',
-        r'\{miny',
-        r'\{epp',
+        # r'\{miny',   # removed – allowed with direct (Mod 1)
+        # r'\{epp',    # removed – allowed with direct (Mod 1)
         r'\{onclick',
         r'\{json=',
         r'\{json_',
         r'\{js_',
+        # {full_history} is NOT in this list (Mod 2)
     ]
+
+    # ------------------------------------------------------------------ #
+    # Gistory API helper                                                   #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def fetch_before_save_urls(company_id):
+        """
+        Fetch before_save_pageurls from the Gistory API for a given
+        company / case id.  Returns a list of URL strings or an empty
+        list on failure.
+        """
+        if not company_id or str(company_id).strip() in ("", "?", "None"):
+            return []
+        try:
+            api_url = (
+                f"https://gistory.merapar.com/api/gistory/gistory"
+                f"?id={company_id}"
+            )
+            resp = requests.get(api_url, timeout=10)
+            if resp.status_code != 200:
+                return []
+            payload = resp.json()
+            # The API returns a list of history snapshots; we want the
+            # most-recent one that has before_save_pageurls.
+            if isinstance(payload, list):
+                for snapshot in payload:
+                    bsurls = snapshot.get("before_save_pageurls", [])
+                    if bsurls:
+                        return bsurls if isinstance(bsurls, list) else []
+            elif isinstance(payload, dict):
+                bsurls = payload.get("before_save_pageurls", [])
+                return bsurls if isinstance(bsurls, list) else []
+        except Exception:
+            pass
+        return []
+
+    # ------------------------------------------------------------------ #
+    # {full_history} check (Modification 2)                               #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def check_full_history(after_urls, before_urls):
+        """
+        If {full_history} template appears in after_save_pageurls, the
+        underlying base URL (stripped of the template token) must NOT
+        already exist in before_save_pageurls.
+
+        Rule: for every after-URL that contains {full_history}, extract
+        the base URL (everything before '{full_history}'), then check
+        whether that base URL (or the full after-URL itself) is present
+        in before_save_pageurls.
+        """
+        issues = []
+        full_history_pattern = re.compile(r'\{full_history\}', re.IGNORECASE)
+
+        # Normalise before_urls to a set of stripped strings for fast lookup
+        before_set = set()
+        for u in before_urls:
+            if isinstance(u, str):
+                before_set.add(u.strip())
+
+        for i, u in enumerate(after_urls, 1):
+            if not isinstance(u, str):
+                continue
+            if not full_history_pattern.search(u):
+                continue
+
+            # Derive the base URL by removing the {full_history} token
+            base_url = full_history_pattern.sub('', u).strip().rstrip('?&')
+
+            # Check whether the base URL or the full URL exists in before_save
+            if base_url in before_set or u.strip() in before_set:
+                issues.append({
+                    "type": "Full History Template - URL Already in Before-Save",
+                    "url_index": i,
+                    "url": u,
+                    "details": (
+                        f"The URL '{base_url}' (or its full form) was found in "
+                        "before_save_pageurls. {full_history} should only be "
+                        "applied to URLs not already tracked in before-save."
+                    )
+                })
+
+        return issues
+
+    # ------------------------------------------------------------------ #
+    # Modification 3 – plain URLs that look like regexes without a prefix #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def check_unprefixed_regex(urls):
+        """
+        Detect URLs that contain regex-specific syntax (negative/positive
+        lookahead/behind, character classes with exclusions, alternation
+        combined with anchors, etc.) but are NOT prefixed with cp:, if:,
+        ev:, or df:.
+
+        Example that must be flagged:
+            https://www.prysmian.com/en/innovation(?!(.*(paper)))
+        """
+        issues = []
+        # Pattern that indicates regex syntax inside a URL
+        regex_syntax_pattern = re.compile(
+            r'\(\?[!<=]'          # lookahead / lookbehind  (?! (?= (?<
+            r'|\(\?P[<>]'         # named group             (?P<
+            r'|\(\?:'             # non-capturing group     (?:
+            r'|\[\^'              # negated char class      [^
+            r'|\(\?i\)'           # inline flag             (?i)
+        )
+        valid_prefixes = re.compile(r'^(cp|if|ev|df):', re.IGNORECASE)
+
+        for i, u in enumerate(urls, 1):
+            if not isinstance(u, str) or len(u) < 5:
+                continue
+            # Skip URLs that already have a valid prefix
+            if valid_prefixes.match(u):
+                continue
+            # Flag if the URL contains regex-specific syntax
+            if regex_syntax_pattern.search(u):
+                issues.append({
+                    "type": "Regex Syntax Without Required Prefix",
+                    "url_index": i,
+                    "url": u,
+                    "details": (
+                        "This URL contains regex syntax (e.g. lookahead/lookbehind, "
+                        "negated character class) but is missing a required prefix. "
+                        "Add cp:, if:, or ev: before the regex pattern."
+                    )
+                })
+        return issues
+
+    # ------------------------------------------------------------------ #
+    # Existing checks (unchanged unless noted)                             #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def parse_json(text):
-        """
-        Parse JSON with multiple fallback methods.
-        Handles complex URLs with ${...} templates inside strings.
-        """
         text = text.strip()
         errs = []
 
-        # Method 1: Direct parse — works for valid JSON
         try:
             return json.loads(text), None
         except json.JSONDecodeError as e:
             errs.append(f"Direct: {e.msg} at line {e.lineno}, col {e.colno}")
 
-        # Method 2: Non-strict parse
         try:
             return json.loads(text, strict=False), None
         except json.JSONDecodeError as e:
             errs.append(f"Non-strict: {e.msg} at line {e.lineno}, col {e.colno}")
 
-        # Method 3: Try to find the JSON object by scanning for matching braces
-        # but respecting string boundaries (skip braces inside quotes)
         try:
             start = text.index('{')
             in_string = False
@@ -95,19 +228,15 @@ class URLAuditor:
 
             for i in range(start, len(text)):
                 ch = text[i]
-
                 if escape_next:
                     escape_next = False
                     continue
-
                 if ch == '\\' and in_string:
                     escape_next = True
                     continue
-
                 if ch == '"' and not escape_next:
                     in_string = not in_string
                     continue
-
                 if not in_string:
                     if ch == '{':
                         brace_depth += 1
@@ -122,24 +251,16 @@ class URLAuditor:
         except (json.JSONDecodeError, ValueError) as e:
             errs.append(f"Extract: {str(e)}")
 
-        # Method 4: Fix common issues — trailing commas, missing commas
         try:
             fixed = text
-            # Find JSON boundaries respecting strings
             start_idx = fixed.index('{')
             fixed = fixed[start_idx:]
-
-            # Remove trailing commas before } or ]
             fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
-
-            # Fix missing commas between lines ending with " and starting with "
             fixed = re.sub(r'"\s*\n\s*"', '",\n"', fixed)
-
             return json.loads(fixed), None
         except (json.JSONDecodeError, ValueError) as e:
             errs.append(f"Fixed: {str(e)}")
 
-        # Method 5: Try with single quotes replaced
         try:
             fixed = text.replace("'", '"')
             fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
@@ -168,7 +289,11 @@ class URLAuditor:
                 continue
             if re.search(r"\{miny", u):
                 if not re.search(r"\$\{miny=\:\d{4}\}", u) or not re.search(pat, u):
-                    issues.append({"type": "MINY Template Incorrect", "url_index": i, "url": u})
+                    issues.append({
+                        "type": "MINY Template Incorrect",
+                        "url_index": i,
+                        "url": u
+                    })
         return issues
 
     @staticmethod
@@ -180,12 +305,15 @@ class URLAuditor:
                 continue
             if re.search(r"\{epp", u):
                 if not re.search(r"\$\{epp=\:\d{1,2}\}", u) or not re.search(pat, u):
-                    issues.append({"type": "EPP Template Incorrect", "url_index": i, "url": u})
+                    issues.append({
+                        "type": "EPP Template Incorrect",
+                        "url_index": i,
+                        "url": u
+                    })
         return issues
 
     @staticmethod
     def check_maxp(urls):
-        """${maxp=:N} is for testing only — must NOT be in saved after URLs."""
         issues = []
         for i, u in enumerate(urls, 1):
             if not isinstance(u, str):
@@ -327,24 +455,19 @@ class URLAuditor:
             alt = alt.strip()
             if not alt:
                 continue
-
             clean = alt.lstrip('/')
-
             has_complex = bool(re.search(
                 r'\.\*|\.\+|\?[!<=(]|\[.*\]|\{.*\}|\\d|\\w|\\s|\(\?',
                 clean
             ))
             if has_complex:
                 continue
-
             clean_check = re.sub(r'/?\??$', '', clean)
-
             if re.match(r'^[a-zA-Z0-9_-]+$', clean_check):
                 weak_parts.append(alt)
 
         if weak_parts:
             return True, f"Weak alternatives: {', '.join(weak_parts[:3])}"
-
         return False, ""
 
     @staticmethod
@@ -460,14 +583,14 @@ class URLAuditor:
     @staticmethod
     def check_metadata(data):
         issues = []
-        agent = str(data.get("status", "") or "").strip().lower()
-        ct = str(data.get("case_type", "") or "").strip().lower()
-        proj = str(data.get("project", "") or "").strip()
-        rs = str(data.get("research_status", "") or "").strip().lower()
-        ia = str(data.get("issue_area", "") or "").strip()
-        fs = str(data.get("final_status", "") or "").strip()
-        irsp = str(data.get("irsp_provider", "") or "").strip()
-        aurls = data.get("after_save_pageurls", [])
+        agent  = str(data.get("status", "")          or "").strip().lower()
+        ct     = str(data.get("case_type", "")        or "").strip().lower()
+        proj   = str(data.get("project", "")          or "").strip()
+        rs     = str(data.get("research_status", "")  or "").strip().lower()
+        ia     = str(data.get("issue_area", "")       or "").strip()
+        fs     = str(data.get("final_status", "")     or "").strip()
+        irsp   = str(data.get("irsp_provider", "")    or "").strip()
+        aurls  = data.get("after_save_pageurls", [])
 
         is_active = bool(re.search(
             r"verified$|manual|escalated_to_technology_team", agent
@@ -512,6 +635,13 @@ class URLAuditor:
             issues.append({"type": "Metadata Error", "field": "case_type",
                            "message": "WD in URLs but case_type=direct"})
 
+        # ---------------------------------------------------------------- #
+        # "Direct case_type but templates" check                            #
+        # ${epp, ${miny and {full_history} are EXCLUDED from this check     #
+        # because they are permitted with case_type=direct (Mods 1 & 2).   #
+        # The TEMPLATE_KEYWORDS list already omits them, so this logic      #
+        # stays the same – just relies on the trimmed keyword list.         #
+        # ---------------------------------------------------------------- #
         if ct == "direct" and aurls and URLAuditor.urls_contain_templates(aurls):
             found_keywords = []
             for u in aurls:
@@ -522,11 +652,12 @@ class URLAuditor:
                         display_kw = kw.replace(r'\{', '{').replace(r'\:', ':')
                         if display_kw not in found_keywords:
                             found_keywords.append(display_kw)
-            kw_list = ", ".join(found_keywords[:5])
-            issues.append({
-                "type": "Metadata Error", "field": "case_type",
-                "message": f"Direct case_type but templates found: {kw_list}"
-            })
+            if found_keywords:           # only raise if something was actually found
+                kw_list = ", ".join(found_keywords[:5])
+                issues.append({
+                    "type": "Metadata Error", "field": "case_type",
+                    "message": f"Direct case_type but templates found: {kw_list}"
+                })
 
         if is_active:
             if not ia:
@@ -554,21 +685,59 @@ class URLAuditor:
 
         return issues
 
+    # ------------------------------------------------------------------ #
+    # Main audit entry-point                                               #
+    # ------------------------------------------------------------------ #
     @classmethod
     def audit_urls(cls, data):
-        urls = data.get("after_save_pageurls", [])
+        after_urls = data.get("after_save_pageurls", [])
         issues = []
-        if urls:
-            for fn in [cls.check_miny, cls.check_epp, cls.check_maxp,
-                       cls.check_xpath, cls.check_onclick, cls.check_jsarg,
-                       cls.check_json_template, cls.check_baseurl,
-                       cls.check_windowflag, cls.check_regex, cls.check_http,
-                       cls.check_brackets, cls.check_duplicates]:
-                issues.extend(fn(urls))
-        issues.extend(cls.check_metadata(data))
-        return {"status": "Complete", "total_urls": len(urls),
-                "issues_found": len(issues), "issues": issues}
 
+        if after_urls:
+            for fn in [
+                cls.check_miny,
+                cls.check_epp,
+                cls.check_maxp,
+                cls.check_xpath,
+                cls.check_onclick,
+                cls.check_jsarg,
+                cls.check_json_template,
+                cls.check_baseurl,
+                cls.check_windowflag,
+                cls.check_regex,
+                cls.check_http,
+                cls.check_brackets,
+                cls.check_duplicates,
+                cls.check_unprefixed_regex,   # Modification 3
+            ]:
+                issues.extend(fn(after_urls))
+
+        # ---------------------------------------------------------------- #
+        # Modification 2 – {full_history} check requires before_save_urls  #
+        # Fetch them from Gistory API only for this check.                  #
+        # ---------------------------------------------------------------- #
+        has_full_history = any(
+            isinstance(u, str) and re.search(r'\{full_history\}', u, re.IGNORECASE)
+            for u in after_urls
+        )
+        if has_full_history:
+            company_id = data.get("as_company_id") or data.get("id", "")
+            before_urls = cls.fetch_before_save_urls(company_id)
+            issues.extend(cls.check_full_history(after_urls, before_urls))
+
+        issues.extend(cls.check_metadata(data))
+
+        return {
+            "status": "Complete",
+            "total_urls": len(after_urls),
+            "issues_found": len(issues),
+            "issues": issues,
+        }
+
+
+# ======================================================================= #
+# Streamlit UI                                                              #
+# ======================================================================= #
 
 def display_url_wrapped(url):
     return f'<div class="url-text">{url}</div>'
@@ -599,6 +768,10 @@ def main():
         **Forbidden in saved URLs:**
         **MAXP** — `${maxp=:N}` is for testing only, must NOT be in after URLs
 
+        **{full_history} check:**
+        If `{full_history}` appears in after-save URLs, the same base URL must
+        **not** already exist in before-save URLs (verified via Gistory API).
+
         **URL checks:**
         HTTP/HTTPS, Multiple HTTP, Brackets, Duplicates
 
@@ -607,9 +780,14 @@ def main():
         - Missing colon after prefix
         - **Weak regex** — each alternative must be more than a single word
         - **Max 3 per type** — no more than 3 of each `ev:`, `cp:`, `df:`, `if:`
+        - **Unprefixed regex** — URLs containing regex syntax (lookahead etc.)
+          without `cp:`, `if:`, or `ev:` prefix are flagged
 
         **Metadata checks:**
         Case type, Agent status, Issue area, Final status, IRSP provider
+
+        > **Note:** `${epp`, `${miny` and `{full_history}` are allowed with
+        > `case_type = direct` and will **not** trigger the template-in-direct error.
         """)
 
     if 'audit_result_data' not in st.session_state:
@@ -663,7 +841,7 @@ def main():
             and st.session_state.audit_json_data is not None):
 
         data = st.session_state.audit_json_data
-        res = st.session_state.audit_result_data
+        res  = st.session_state.audit_result_data
 
         if not isinstance(res, dict) or "issues_found" not in res:
             st.error("Audit results corrupted. Please run audit again.")
@@ -674,7 +852,7 @@ def main():
 
         st.markdown("---")
         ticker = data.get("ticker", data.get("as_company_id", "?"))
-        cid = data.get("as_company_id", data.get("id", "?"))
+        cid    = data.get("as_company_id", data.get("id", "?"))
         st.header(f"📊 {ticker} ({cid})")
         st.caption(f"Agent Status: **{data.get('status', 'N/A')}**")
 
@@ -685,7 +863,7 @@ def main():
             st.metric("Issues", res.get("issues_found", 0))
         with m3:
             st.metric("Status",
-                       "✅ PASS" if res.get("issues_found", 0) == 0 else "❌ FAIL")
+                      "✅ PASS" if res.get("issues_found", 0) == 0 else "❌ FAIL")
 
         with st.expander("📋 Parsed Fields", expanded=False):
             f1, f2 = st.columns(2)
@@ -706,6 +884,7 @@ def main():
             by_type = {}
             for iss in res.get("issues", []):
                 by_type.setdefault(iss["type"], []).append(iss)
+
             for itype, ilist in by_type.items():
                 with st.expander(f"**{itype}** ({len(ilist)})", expanded=True):
                     for i, iss in enumerate(ilist, 1):
@@ -725,12 +904,13 @@ def main():
                             st.info(iss['details'])
                         if i < len(ilist):
                             st.markdown("---")
+
             st.table([{"Issue": t, "Count": len(l)} for t, l in by_type.items()])
 
     st.markdown("---")
     st.markdown(
         '<div style="text-align:center;color:#666;padding:20px;">'
-        'URL Audit Tool v3.4</div>',
+        'URL Audit Tool v3.5</div>',
         unsafe_allow_html=True
     )
 
